@@ -97,6 +97,7 @@ body {
 /* ======== CARTOON DIALOG PANEL ======== */
 .dialog-panel {
   background: var(--card-bg);
+  color: #3D2B1F;
   border: 4px solid var(--cartoon-purple);
   border-radius: 28px;
   box-shadow:
@@ -120,6 +121,7 @@ body {
 /* ======== CARTOON CARDS ======== */
 .cartoon-card {
   background: white;
+  color: #3D2B1F;
   border: 3px solid #E8D5B7;
   border-radius: 20px;
   box-shadow:
@@ -480,6 +482,7 @@ body {
 .speech-bubble {
   position: relative;
   background: white;
+  color: #3D2B1F;
   border: 3px solid var(--cartoon-purple);
   border-radius: 20px;
   padding: 16px 20px;
