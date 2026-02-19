@@ -9,9 +9,14 @@ import WordReveal from '@/components/WordReveal';
 import ConversationPhase from '@/components/ConversationPhase';
 import VotingPhase from '@/components/VotingPhase';
 import ResultPhase from '@/components/ResultPhase';
+import ModeSelection from '@/components/ModeSelection';
+import OnlineGame from '@/components/OnlineGame';
 import { DecoItems, DetectiveNarrator } from '@/components/CartoonElements';
 
+type GameMode = 'select' | 'local' | 'online';
+
 export default function Home() {
+  const [gameMode, setGameMode] = useState<GameMode>('select');
   const [gameState, setGameState] = useState<GameState>(initialGameState);
 
   const addPlayer = (name: string) => {
@@ -149,63 +154,92 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Game Phase Content */}
+        {/* Game Content */}
         <div className="animate-fade-in">
-          {gameState.phase === 'setup' && (
-            <PlayerSetup
-              players={gameState.players}
-              onAddPlayer={addPlayer}
-              onRemovePlayer={removePlayer}
-              onStartGame={startGameSetup}
+          {/* Mode Selection */}
+          {gameMode === 'select' && (
+            <ModeSelection
+              onSelectLocal={() => setGameMode('local')}
+              onSelectOnline={() => setGameMode('online')}
             />
           )}
 
-          {gameState.phase === 'settings' && (
-            <GameSettingsPage
-              players={gameState.players}
-              onStartGame={startGame}
-              onBack={() => setGameState(prev => ({ ...prev, phase: 'setup' }))}
-            />
+          {/* Online Mode */}
+          {gameMode === 'online' && (
+            <OnlineGame onBack={() => setGameMode('select')} />
           )}
 
-          {gameState.phase === 'reveal' && (
-            <WordReveal
-              players={gameState.players}
-              currentPlayerIndex={gameState.currentPlayerRevealIndex}
-              word={gameState.currentWord!}
-              hint={gameState.currentHint!}
-              useHint={gameState.settings!.useHintForImposter}
-              onNext={nextPlayerReveal}
-            />
-          )}
+          {/* Local Mode */}
+          {gameMode === 'local' && (
+            <>
+              {gameState.phase === 'setup' && (
+                <div>
+                  <PlayerSetup
+                    players={gameState.players}
+                    onAddPlayer={addPlayer}
+                    onRemovePlayer={removePlayer}
+                    onStartGame={startGameSetup}
+                  />
+                  <button
+                    onClick={() => {
+                      setGameMode('select');
+                      setGameState(initialGameState);
+                    }}
+                    className="btn-cartoon w-full py-3 mt-4 text-gray-500 hover:text-gray-700 border-2 border-gray-200 hover:border-gray-300 max-w-2xl mx-auto block"
+                  >
+                    ← Back to Mode Selection
+                  </button>
+                </div>
+              )}
 
-          {gameState.phase === 'conversation' && (
-            <ConversationPhase
-              players={gameState.players}
-              currentSpeakerIndex={gameState.currentSpeakerIndex}
-              conversationRound={gameState.conversationRound}
-              totalRounds={gameState.settings!.numberOfConversations}
-              onStartVoting={startVoting}
-            />
-          )}
+              {gameState.phase === 'settings' && (
+                <GameSettingsPage
+                  players={gameState.players}
+                  onStartGame={startGame}
+                  onBack={() => setGameState(prev => ({ ...prev, phase: 'setup' }))}
+                />
+              )}
 
-          {gameState.phase === 'voting' && (
-            <VotingPhase
-              players={gameState.players}
-              votes={gameState.votes}
-              onVote={castVote}
-              onShowResults={showResults}
-            />
-          )}
+              {gameState.phase === 'reveal' && (
+                <WordReveal
+                  players={gameState.players}
+                  currentPlayerIndex={gameState.currentPlayerRevealIndex}
+                  word={gameState.currentWord!}
+                  hint={gameState.currentHint!}
+                  useHint={gameState.settings!.useHintForImposter}
+                  onNext={nextPlayerReveal}
+                />
+              )}
 
-          {gameState.phase === 'result' && (
-            <ResultPhase
-              players={gameState.players}
-              votes={gameState.votes}
-              imposters={gameState.imposters}
-              word={gameState.currentWord!}
-              onNewGame={resetGame}
-            />
+              {gameState.phase === 'conversation' && (
+                <ConversationPhase
+                  players={gameState.players}
+                  currentSpeakerIndex={gameState.currentSpeakerIndex}
+                  conversationRound={gameState.conversationRound}
+                  totalRounds={gameState.settings!.numberOfConversations}
+                  onStartVoting={startVoting}
+                />
+              )}
+
+              {gameState.phase === 'voting' && (
+                <VotingPhase
+                  players={gameState.players}
+                  votes={gameState.votes}
+                  onVote={castVote}
+                  onShowResults={showResults}
+                />
+              )}
+
+              {gameState.phase === 'result' && (
+                <ResultPhase
+                  players={gameState.players}
+                  votes={gameState.votes}
+                  imposters={gameState.imposters}
+                  word={gameState.currentWord!}
+                  onNewGame={resetGame}
+                />
+              )}
+            </>
           )}
         </div>
       </div>

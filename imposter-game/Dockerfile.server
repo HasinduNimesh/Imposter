@@ -1,0 +1,22 @@
+FROM node:20-slim
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* ./
+
+# Install all dependencies (need tsx for runtime)
+RUN npm install
+
+# Copy server and shared lib files
+COPY server/ ./server/
+COPY lib/onlineTypes.ts ./lib/onlineTypes.ts
+
+# Expose the port
+EXPOSE 3001
+
+ENV PORT=3001
+ENV NODE_ENV=production
+
+# Start the server
+CMD ["npx", "tsx", "server/index.ts"]
