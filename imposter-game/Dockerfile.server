@@ -12,10 +12,9 @@ RUN npm install
 COPY server/ ./server/
 COPY lib/onlineTypes.ts ./lib/onlineTypes.ts
 
-# Expose the port
-EXPOSE 3001
+# Expose the port (Render sets PORT dynamically, default 10000)
+EXPOSE 10000
 
-ENV PORT=3001
 ENV NODE_ENV=production
 
 # Start the server

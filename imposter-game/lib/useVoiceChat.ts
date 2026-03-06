@@ -6,6 +6,9 @@ import type { GameSocket } from '@/lib/socketClient';
 interface PeerConnection {
   pc: RTCPeerConnection;
   remoteStream: MediaStream;
+  iceCandidateQueue: RTCIceCandidateInit[];
+  remoteDescriptionSet: boolean;
+  retryCount: number;
 }
 
 interface VoicePeer {
@@ -20,8 +23,28 @@ const ICE_SERVERS: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    // Free TURN servers for devices behind symmetric NATs (mobile networks etc.)
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 4,
 };
+
+const MAX_PEER_RETRIES = 3;
+const RETRY_DELAY_MS = 2000;
 
 export function useVoiceChat(
   socket: GameSocket | null,
@@ -40,6 +63,35 @@ export function useVoiceChat(
   const audioContextRef = useRef<AudioContext | null>(null);
   const analysersRef = useRef<Map<string, AnalyserNode>>(new Map());
   const speakingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const playersRef = useRef(players);
+  const socketRef = useRef(socket);
+
+  // Keep refs up to date
+  useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => { socketRef.current = socket; }, [socket]);
+
+  // Helper: ensure AudioContext is running (browsers suspend it until user gesture)
+  const ensureAudioContext = useCallback(() => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().catch(() => {});
+    }
+    return audioContextRef.current;
+  }, []);
+
+  // Helper: flush queued ICE candidates once remote description is set
+  const flushIceCandidates = useCallback(async (peer: PeerConnection) => {
+    while (peer.iceCandidateQueue.length > 0) {
+      const candidate = peer.iceCandidateQueue.shift()!;
+      try {
+        await peer.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.warn('Error adding queued ICE candidate:', err);
+      }
+    }
+  }, []);
 
   // Cleanup all peer connections
   const cleanupPeers = useCallback(() => {
@@ -79,6 +131,14 @@ export function useVoiceChat(
   // Create peer connection for a remote user
   const createPeerConnection = useCallback(
     (remoteId: string): PeerConnection => {
+      // Close any existing connection for this peer first
+      const existing = peersRef.current.get(remoteId);
+      if (existing) {
+        existing.pc.close();
+        peersRef.current.delete(remoteId);
+        analysersRef.current.delete(remoteId);
+      }
+
       const pc = new RTCPeerConnection(ICE_SERVERS);
       const remoteStream = new MediaStream();
 
@@ -89,31 +149,47 @@ export function useVoiceChat(
         });
       }
 
-      // Handle incoming remote tracks
-      pc.ontrack = (event) => {
-        event.streams[0]?.getTracks().forEach(track => {
-          remoteStream.addTrack(track);
-        });
+      const peerConn: PeerConnection = {
+        pc,
+        remoteStream,
+        iceCandidateQueue: [],
+        remoteDescriptionSet: false,
+        retryCount: 0,
+      };
 
-        // Set up analyser for this peer
-        if (!audioContextRef.current) {
-          audioContextRef.current = new AudioContext();
-        }
+      // Handle incoming remote tracks — use event.track directly (not event.streams[0])
+      // Some browsers don't associate the track with a stream
+      pc.ontrack = (event) => {
+        // Add the track directly to our managed remoteStream
+        remoteStream.addTrack(event.track);
+
+        // Handle track ending — remove from stream
+        event.track.onended = () => {
+          remoteStream.removeTrack(event.track);
+        };
+
+        // Set up audio analyser for speaking detection
         try {
-          const source = audioContextRef.current.createMediaStreamSource(remoteStream);
-          const analyser = audioContextRef.current.createAnalyser();
+          const ac = ensureAudioContext();
+          const source = ac.createMediaStreamSource(remoteStream);
+          const analyser = ac.createAnalyser();
           analyser.fftSize = 512;
           source.connect(analyser);
           analysersRef.current.set(remoteId, analyser);
         } catch {
-          // Ignore analyser errors
+          // Ignore analyser errors — not critical for audio playback
         }
 
         // Update peers list
-        const player = players.find(p => p.id === remoteId);
+        const player = playersRef.current.find(p => p.id === remoteId);
         setVoicePeers(prev => {
-          const exists = prev.find(p => p.id === remoteId);
-          if (exists) return prev;
+          const existingIdx = prev.findIndex(p => p.id === remoteId);
+          if (existingIdx >= 0) {
+            // Update existing peer's stream
+            const updated = [...prev];
+            updated[existingIdx] = { ...updated[existingIdx], stream: remoteStream };
+            return updated;
+          }
           return [...prev, {
             id: remoteId,
             name: player?.name || 'Unknown',
@@ -125,35 +201,98 @@ export function useVoiceChat(
 
       // Send ICE candidates
       pc.onicecandidate = (event) => {
-        if (event.candidate && socket) {
+        if (event.candidate && socketRef.current) {
           // @ts-expect-error - custom signaling event
-          socket.emit('webrtc-ice-candidate', {
+          socketRef.current.emit('webrtc-ice-candidate', {
             targetId: remoteId,
             candidate: event.candidate.toJSON(),
           });
         }
       };
 
+      // Handle connection state changes — retry failed connections
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-          // Remove peer
-          peersRef.current.delete(remoteId);
-          analysersRef.current.delete(remoteId);
-          setVoicePeers(prev => prev.filter(p => p.id !== remoteId));
+        const state = pc.connectionState;
+        console.log(`WebRTC ${remoteId.slice(0, 6)}: ${state}`);
+
+        if (state === 'failed') {
+          // Retry the connection if under max retries
+          const peer = peersRef.current.get(remoteId);
+          if (peer && peer.retryCount < MAX_PEER_RETRIES && localStreamRef.current) {
+            peer.retryCount++;
+            console.log(`Retrying connection to ${remoteId.slice(0, 6)} (attempt ${peer.retryCount})`);
+            pc.close();
+            peersRef.current.delete(remoteId);
+            analysersRef.current.delete(remoteId);
+
+            // Retry after a short delay
+            setTimeout(() => {
+              if (!localStreamRef.current || !socketRef.current) return;
+              const newPeer = createPeerConnection(remoteId);
+              newPeer.retryCount = peer.retryCount;
+              initiateOffer(remoteId, newPeer);
+            }, RETRY_DELAY_MS);
+          } else {
+            // Give up — remove peer
+            peersRef.current.delete(remoteId);
+            analysersRef.current.delete(remoteId);
+            setVoicePeers(prev => prev.filter(p => p.id !== remoteId));
+          }
+        } else if (state === 'disconnected') {
+          // Wait briefly — might recover on its own
+          setTimeout(() => {
+            if (pc.connectionState === 'disconnected') {
+              // Still disconnected — try ICE restart
+              pc.restartIce();
+            }
+          }, 3000);
         }
       };
 
-      const peerConn: PeerConnection = { pc, remoteStream };
+      // Handle ICE connection state for additional diagnostics
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'failed') {
+          // Try ICE restart before giving up
+          pc.restartIce();
+        }
+      };
+
       peersRef.current.set(remoteId, peerConn);
       return peerConn;
     },
-    [socket, players]
+    [ensureAudioContext]
   );
+
+  // Helper: create and send an offer to a remote peer
+  const initiateOffer = useCallback(async (remoteId: string, peer: PeerConnection) => {
+    if (!socketRef.current) return;
+    try {
+      makingOfferRef.current.add(remoteId);
+      const offer = await peer.pc.createOffer({
+        offerToReceiveAudio: true,
+      });
+      await peer.pc.setLocalDescription(offer);
+
+      // @ts-expect-error - custom signaling event
+      socketRef.current.emit('webrtc-offer', {
+        targetId: remoteId,
+        offer: peer.pc.localDescription,
+      });
+    } catch (err) {
+      console.warn('Error creating offer for peer:', err);
+    } finally {
+      makingOfferRef.current.delete(remoteId);
+    }
+  }, []);
 
   // Enable voice chat
   const enableVoice = useCallback(async () => {
     try {
       setMicError(null);
+
+      // Resume AudioContext (needs user gesture)
+      ensureAudioContext();
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -178,9 +317,21 @@ export function useVoiceChat(
       }
     } catch (err) {
       console.error('Mic access error:', err);
-      setMicError('Could not access microphone. Please allow mic permission and try again.');
+      if (err instanceof DOMException) {
+        if (err.name === 'NotAllowedError') {
+          setMicError('Microphone permission denied. Please allow mic access in your browser settings.');
+        } else if (err.name === 'NotFoundError') {
+          setMicError('No microphone found. Please connect a microphone and try again.');
+        } else if (err.name === 'NotReadableError') {
+          setMicError('Microphone is in use by another app. Close other apps using the mic and try again.');
+        } else {
+          setMicError(`Microphone error: ${err.message}`);
+        }
+      } else {
+        setMicError('Could not access microphone. Please allow mic permission and try again.');
+      }
     }
-  }, [socket, lobbyCode]);
+  }, [socket, lobbyCode, ensureAudioContext]);
 
   // Disable voice chat
   const disableVoice = useCallback(() => {
@@ -211,7 +362,7 @@ export function useVoiceChat(
     // roll back its own offer when it receives a conflicting one.
     const isPolite = (remoteId: string) => myId < remoteId;
 
-    // Someone wants to connect voice with us
+    // Someone sends us an offer
     const handleVoiceOffer = async (data: { fromId: string; offer: RTCSessionDescriptionInit }) => {
       if (!localStreamRef.current) return;
 
@@ -231,17 +382,22 @@ export function useVoiceChat(
 
       try {
         // If there's a collision and we are the polite peer, rollback first
-        if (offerCollision) {
+        if (offerCollision && peer.pc.signalingState !== 'stable') {
           await peer.pc.setLocalDescription({ type: 'rollback' });
         }
         await peer.pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+        peer.remoteDescriptionSet = true;
+
+        // Flush any queued ICE candidates now that remote description is set
+        await flushIceCandidates(peer);
+
         const answer = await peer.pc.createAnswer();
         await peer.pc.setLocalDescription(answer);
 
         // @ts-expect-error - custom signaling event
         socket.emit('webrtc-answer', {
           targetId: data.fromId,
-          answer: answer,
+          answer: peer.pc.localDescription,
         });
       } catch (err) {
         console.warn('Error handling voice offer:', err);
@@ -259,6 +415,10 @@ export function useVoiceChat(
 
       try {
         await peer.pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        peer.remoteDescriptionSet = true;
+
+        // Flush any queued ICE candidates
+        await flushIceCandidates(peer);
       } catch (err) {
         console.warn('Error setting remote answer:', err);
       }
@@ -266,12 +426,18 @@ export function useVoiceChat(
 
     const handleIceCandidate = async (data: { fromId: string; candidate: RTCIceCandidateInit }) => {
       const peer = peersRef.current.get(data.fromId);
-      if (peer) {
-        try {
-          await peer.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-        } catch {
-          // Ignore ICE candidate errors — may arrive before remote description
-        }
+      if (!peer) return;
+
+      // Queue ICE candidates if remote description isn't set yet
+      if (!peer.remoteDescriptionSet) {
+        peer.iceCandidateQueue.push(data.candidate);
+        return;
+      }
+
+      try {
+        await peer.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (err) {
+        console.warn('Error adding ICE candidate:', err);
       }
     };
 
@@ -281,21 +447,7 @@ export function useVoiceChat(
       if (data.peerId === myId) return;
 
       const peer = createPeerConnection(data.peerId);
-      try {
-        makingOfferRef.current.add(data.peerId);
-        const offer = await peer.pc.createOffer();
-        await peer.pc.setLocalDescription(offer);
-
-        // @ts-expect-error - custom signaling event
-        socket.emit('webrtc-offer', {
-          targetId: data.peerId,
-          offer: offer,
-        });
-      } catch (err) {
-        console.warn('Error creating offer for peer:', err);
-      } finally {
-        makingOfferRef.current.delete(data.peerId);
-      }
+      await initiateOffer(data.peerId, peer);
     };
 
     // A peer left voice
@@ -309,30 +461,15 @@ export function useVoiceChat(
       }
     };
 
-    // Listen for existing voice peers when we join
-    const handleVoicePeersList = (data: { peerIds: string[] }) => {
-      // We'll initiate offers to each existing peer
-      data.peerIds.forEach(async (peerId) => {
-        if (peerId === myId) return;
-        if (!localStreamRef.current) return;
+    // Listen for existing voice peers when we join — process sequentially to avoid SDP races
+    const handleVoicePeersList = async (data: { peerIds: string[] }) => {
+      for (const peerId of data.peerIds) {
+        if (peerId === myId) continue;
+        if (!localStreamRef.current) break;
 
         const peer = createPeerConnection(peerId);
-        try {
-          makingOfferRef.current.add(peerId);
-          const offer = await peer.pc.createOffer();
-          await peer.pc.setLocalDescription(offer);
-
-          // @ts-expect-error - custom signaling event
-          socket.emit('webrtc-offer', {
-            targetId: peerId,
-            offer: offer,
-          });
-        } catch (err) {
-          console.warn('Error creating offer for existing peer:', err);
-        } finally {
-          makingOfferRef.current.delete(peerId);
-        }
-      });
+        await initiateOffer(peerId, peer);
+      }
     };
 
     // @ts-expect-error - custom signaling events
@@ -362,7 +499,7 @@ export function useVoiceChat(
       // @ts-expect-error - custom signaling events
       socket.off('voice-peers-list', handleVoicePeersList);
     };
-  }, [socket, myId, createPeerConnection]);
+  }, [socket, myId, createPeerConnection, flushIceCandidates, initiateOffer]);
 
   // Detect who's speaking (audio level analysis)
   useEffect(() => {

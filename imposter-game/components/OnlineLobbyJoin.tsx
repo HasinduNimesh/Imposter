@@ -6,6 +6,7 @@ import { DetectiveNarrator } from './CartoonElements';
 interface OnlineLobbyJoinProps {
   onCreateLobby: (playerName: string) => void;
   onJoinLobby: (code: string, playerName: string) => void;
+  onRejoinLobby: (code: string, playerName: string) => void;
   onBack: () => void;
   error: string | null;
   isConnecting: boolean;
@@ -14,13 +15,15 @@ interface OnlineLobbyJoinProps {
 export default function OnlineLobbyJoin({
   onCreateLobby,
   onJoinLobby,
+  onRejoinLobby,
   onBack,
   error,
   isConnecting,
 }: OnlineLobbyJoinProps) {
-  const [tab, setTab] = useState<'create' | 'join'>('create');
+  const [tab, setTab] = useState<'create' | 'join' | 'rejoin'>('create');
   const [playerName, setPlayerName] = useState('');
   const [lobbyCode, setLobbyCode] = useState('');
+  const [rejoinCode, setRejoinCode] = useState('');
 
   const handleCreate = () => {
     if (playerName.trim()) {
@@ -31,6 +34,12 @@ export default function OnlineLobbyJoin({
   const handleJoin = () => {
     if (playerName.trim() && lobbyCode.trim()) {
       onJoinLobby(lobbyCode.trim().toUpperCase(), playerName.trim());
+    }
+  };
+
+  const handleRejoin = () => {
+    if (playerName.trim() && rejoinCode.trim()) {
+      onRejoinLobby(rejoinCode.trim().toUpperCase(), playerName.trim());
     }
   };
 
@@ -59,7 +68,7 @@ export default function OnlineLobbyJoin({
               : 'bg-white text-gray-500 border-gray-200 hover:border-purple-300'
           }`}
         >
-          🏠 Create Lobby
+          🏠 Create
         </button>
         <button
           onClick={() => setTab('join')}
@@ -69,7 +78,17 @@ export default function OnlineLobbyJoin({
               : 'bg-white text-gray-500 border-gray-200 hover:border-blue-300'
           }`}
         >
-          🔗 Join Lobby
+          🔗 Join
+        </button>
+        <button
+          onClick={() => setTab('rejoin')}
+          className={`flex-1 py-3 px-4 rounded-xl font-bold text-sm transition-all border-2 ${
+            tab === 'rejoin'
+              ? 'bg-amber-500 text-white border-amber-600 shadow-lg'
+              : 'bg-white text-gray-500 border-gray-200 hover:border-amber-300'
+          }`}
+        >
+          🔄 Rejoin
         </button>
       </div>
 
@@ -133,6 +152,37 @@ export default function OnlineLobbyJoin({
             className="btn-cartoon btn-cartoon-success w-full py-4 text-lg"
           >
             {isConnecting ? '⏳ Joining...' : '🔗 Join Lobby'}
+          </button>
+        </div>
+      )}
+
+      {/* Rejoin Tab */}
+      {tab === 'rejoin' && (
+        <div className="animate-fade-in">
+          <div className="bg-amber-50 border-2 border-amber-200 rounded-xl p-4 mb-4">
+            <p className="text-amber-700 text-sm">
+              <strong>Lost connection?</strong> Enter the same name and room code you used before.
+              You have 60 seconds from when you disconnected to rejoin.
+            </p>
+          </div>
+          <div className="mb-4">
+            <label className="text-sm font-semibold text-gray-600 mb-2 block">Room Code</label>
+            <input
+              type="text"
+              value={rejoinCode}
+              onChange={(e) => setRejoinCode(e.target.value.toUpperCase())}
+              onKeyDown={(e) => handleKeyPress(e, handleRejoin)}
+              placeholder="Enter 6-letter code..."
+              className="cartoon-input w-full text-center text-2xl tracking-[0.3em] font-bold uppercase"
+              maxLength={6}
+            />
+          </div>
+          <button
+            onClick={handleRejoin}
+            disabled={!playerName.trim() || rejoinCode.length !== 6 || isConnecting}
+            className="btn-cartoon w-full py-4 text-lg bg-amber-500 text-white border-2 border-amber-600 hover:bg-amber-600"
+          >
+            {isConnecting ? '⏳ Rejoining...' : '🔄 Rejoin Game'}
           </button>
         </div>
       )}

@@ -96,29 +96,33 @@ export default function OnlineWaitingRoom({
               key={player.id}
               className={`cartoon-card flex items-center justify-between p-3 animate-fade-in-scale ${
                 player.id === myId ? 'ring-2 ring-purple-400' : ''
-              }`}
+              } ${player.isDisconnected ? 'opacity-50' : ''}`}
               style={{ animationDelay: `${index * 0.05}s` }}
             >
               <div className="flex items-center gap-3">
                 <div
-                  className="player-avatar text-xl"
+                  className={`player-avatar text-xl ${player.isDisconnected ? 'grayscale' : ''}`}
                   style={{ background: getPlayerColor(index) }}
                 >
                   {getPlayerAvatar(index)}
                 </div>
                 <div>
-                  <span className="font-semibold text-gray-800 text-lg">
+                  <span className={`font-semibold text-lg ${player.isDisconnected ? 'text-gray-400' : 'text-gray-800'}`}>
                     {player.name}
                     {player.id === myId && (
                       <span className="text-xs text-purple-500 ml-2">(You)</span>
                     )}
                   </span>
                   <p className="text-xs text-gray-400">
-                    {player.isHost ? '👑 Host' : `Player ${index + 1}`}
+                    {player.isDisconnected
+                      ? '⏳ Reconnecting...'
+                      : player.isHost
+                        ? '👑 Host'
+                        : `Player ${index + 1}`}
                   </p>
                 </div>
               </div>
-              {isHost && player.id !== myId && (
+              {isHost && player.id !== myId && !player.isDisconnected && (
                 <button
                   onClick={() => onKickPlayer(player.id)}
                   className="btn-cartoon btn-cartoon-danger px-3 py-1 text-xs"

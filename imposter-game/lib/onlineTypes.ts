@@ -7,6 +7,7 @@ export interface LobbyPlayer {
   isReady: boolean;
   hasRevealedWord: boolean;
   hasVoted: boolean;
+  isDisconnected?: boolean; // true when player temporarily disconnected
 }
 
 export interface LobbySettings {
@@ -49,12 +50,23 @@ export interface GameResults {
   impostersWin: boolean;
 }
 
+// Chat message
+export interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  timestamp: number;
+  type: 'player' | 'system';
+}
+
 // ===== Socket Event Types =====
 
 // Client -> Server events
 export interface ClientToServerEvents {
   'create-lobby': (playerName: string) => void;
   'join-lobby': (data: { code: string; playerName: string }) => void;
+  'rejoin-lobby': (data: { code: string; playerName: string }) => void;
   'leave-lobby': () => void;
   'start-settings': () => void;
   'start-game': (settings: LobbySettings) => void;
@@ -62,6 +74,7 @@ export interface ClientToServerEvents {
   'cast-vote': (votedForId: string) => void;
   'new-game': () => void;
   'kick-player': (playerId: string) => void;
+  'send-message': (text: string) => void;
 }
 
 // Server -> Client events
@@ -71,12 +84,18 @@ export interface ServerToClientEvents {
   'lobby-updated': (lobby: LobbyState) => void;
   'player-joined': (data: { player: LobbyPlayer; lobby: LobbyState }) => void;
   'player-left': (data: { playerId: string; lobby: LobbyState }) => void;
+  'player-disconnected': (data: { playerId: string; playerName: string; lobby: LobbyState }) => void;
+  'player-reconnected': (data: { playerId: string; playerName: string; lobby: LobbyState }) => void;
+  'host-changed': (data: { newHostId: string; newHostName: string; lobby: LobbyState }) => void;
   'settings-phase': (lobby: LobbyState) => void;
   'game-started': (data: { lobby: LobbyState; playerData: PlayerGameData }) => void;
+  'rejoined-game': (data: { lobby: LobbyState; playerData: PlayerGameData | null; gameResults: GameResults | null }) => void;
   'all-revealed': (lobby: LobbyState) => void;
   'phase-changed': (lobby: LobbyState) => void;
   'vote-update': (data: { votedCount: number; totalPlayers: number }) => void;
   'game-results': (results: GameResults) => void;
   'player-kicked': (data: { playerId: string }) => void;
+  'chat-message': (message: ChatMessage) => void;
+  'chat-history': (messages: ChatMessage[]) => void;
   'error': (message: string) => void;
 }

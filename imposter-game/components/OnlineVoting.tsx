@@ -34,7 +34,7 @@ export default function OnlineVoting({
         <div className="text-center py-8">
           <div className="text-5xl mb-4 animate-float">🗳️</div>
           <p className="text-gray-500 font-medium text-lg mb-4">
-            {votedCount}/{lobby.players.length} players have voted
+            {votedCount}/{lobby.players.filter(p => !p.isDisconnected).length} players have voted
           </p>
           <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden max-w-xs mx-auto">
             <div
@@ -71,7 +71,7 @@ export default function OnlineVoting({
       {/* Vote Options */}
       <div className="space-y-3">
         {lobby.players
-          .filter((p) => p.id !== myId)
+          .filter((p) => p.id !== myId && !p.isDisconnected)
           .map((player) => {
             const index = lobby.players.findIndex((p) => p.id === player.id);
             return (
@@ -95,10 +95,34 @@ export default function OnlineVoting({
               </button>
             );
           })}
+
+        {/* Disconnected players shown as disabled */}
+        {lobby.players
+          .filter((p) => p.id !== myId && p.isDisconnected)
+          .map((player) => {
+            const index = lobby.players.findIndex((p) => p.id === player.id);
+            return (
+              <div
+                key={player.id}
+                className="w-full cartoon-card flex items-center gap-4 p-4 opacity-40 cursor-not-allowed"
+              >
+                <div
+                  className="player-avatar text-xl grayscale"
+                  style={{ background: getPlayerColor(index) }}
+                >
+                  {getPlayerAvatar(index)}
+                </div>
+                <span className="font-bold text-gray-400 text-lg flex-1 text-left">
+                  {player.name}
+                </span>
+                <span className="text-gray-400 text-xs">⏳ Disconnected</span>
+              </div>
+            );
+          })}
       </div>
 
       <p className="text-center text-gray-400 text-xs mt-4">
-        {votedCount}/{lobby.players.length} votes cast
+        {votedCount}/{lobby.players.filter(p => !p.isDisconnected).length} votes cast
       </p>
     </div>
   );

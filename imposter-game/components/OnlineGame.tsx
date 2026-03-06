@@ -7,6 +7,7 @@ import type {
   LobbySettings,
   PlayerGameData,
   GameResults,
+  ChatMessage,
 } from '@/lib/onlineTypes';
 import OnlineLobbyJoin from './OnlineLobbyJoin';
 import OnlineWaitingRoom from './OnlineWaitingRoom';
@@ -16,6 +17,7 @@ import OnlineConversation from './OnlineConversation';
 import OnlineVoting from './OnlineVoting';
 import OnlineResult from './OnlineResult';
 import VoiceChatBar from './VoiceChatBar';
+import ChatPanel from './ChatPanel';
 import { useVoiceChat } from '@/lib/useVoiceChat';
 
 type OnlineScreen = 'join' | 'lobby';
@@ -23,6 +25,10 @@ type OnlineScreen = 'join' | 'lobby';
 interface OnlineGameProps {
   onBack: () => void;
 }
+
+// Session persistence keys
+const SESSION_KEY_CODE = 'imposter_lobby_code';
+const SESSION_KEY_NAME = 'imposter_player_name';
 
 export default function OnlineGame({ onBack }: OnlineGameProps) {
   const [screen, setScreen] = useState<OnlineScreen>('join');
@@ -35,6 +41,14 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [hasVoted, setHasVoted] = useState(false);
   const [votedCount, setVotedCount] = useState(0);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  // Chat
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const isChatOpenRef = useRef(false);
 
   // Voice chat
   const voice = useVoiceChat(
@@ -44,8 +58,45 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
     lobby?.players.map(p => ({ id: p.id, name: p.name })) || []
   );
 
+  // Keep isChatOpenRef in sync
+  useEffect(() => {
+    isChatOpenRef.current = isChatOpen;
+    if (isChatOpen) setUnreadCount(0);
+  }, [isChatOpen]);
+
   // Use ref to track if we've setup listeners to avoid duplicates
   const listenersSetup = useRef(false);
+  const reconnectAttempted = useRef(false);
+
+  // Show a temporary toast notification
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  // Save session info for rejoin
+  const saveSession = useCallback((code: string, name: string) => {
+    try {
+      sessionStorage.setItem(SESSION_KEY_CODE, code);
+      sessionStorage.setItem(SESSION_KEY_NAME, name);
+    } catch { /* ignore in case sessionStorage unavailable */ }
+  }, []);
+
+  const clearSession = useCallback(() => {
+    try {
+      sessionStorage.removeItem(SESSION_KEY_CODE);
+      sessionStorage.removeItem(SESSION_KEY_NAME);
+    } catch { /* ignore */ }
+  }, []);
+
+  const getSession = useCallback((): { code: string; name: string } | null => {
+    try {
+      const code = sessionStorage.getItem(SESSION_KEY_CODE);
+      const name = sessionStorage.getItem(SESSION_KEY_NAME);
+      if (code && name) return { code, name };
+    } catch { /* ignore */ }
+    return null;
+  }, []);
 
   const setupListeners = useCallback((s: GameSocket) => {
     if (listenersSetup.current) return;
@@ -53,6 +104,22 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
 
     s.on('connect', () => {
       setMyId(s.id || '');
+
+      // If we were in a game and got disconnected, attempt auto-rejoin
+      const session = (() => {
+        try {
+          const code = sessionStorage.getItem(SESSION_KEY_CODE);
+          const name = sessionStorage.getItem(SESSION_KEY_NAME);
+          if (code && name) return { code, name };
+        } catch { /* ignore */ }
+        return null;
+      })();
+
+      if (session && !reconnectAttempted.current) {
+        reconnectAttempted.current = true;
+        setIsReconnecting(true);
+        s.emit('rejoin-lobby', { code: session.code, playerName: session.name });
+      }
     });
 
     s.on('lobby-created', ({ code, lobby: lobbyData }) => {
@@ -60,7 +127,11 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
       setLobby(lobbyData);
       setScreen('lobby');
       setIsConnecting(false);
+      setIsReconnecting(false);
       setError(null);
+      // Save session for rejoin
+      const me = lobbyData.players.find(p => p.id === s.id);
+      if (me) saveSession(code, me.name);
     });
 
     s.on('lobby-joined', ({ lobby: lobbyData, playerId }) => {
@@ -69,12 +140,27 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
       setLobby(lobbyData);
       setScreen('lobby');
       setIsConnecting(false);
+      setIsReconnecting(false);
       setError(null);
+      const me = lobbyData.players.find(p => p.id === playerId);
+      if (me) saveSession(lobbyData.code, me.name);
+    });
+
+    s.on('rejoined-game', ({ lobby: lobbyData, playerData: pd, gameResults: gr }) => {
+      console.log('Rejoined game in lobby:', lobbyData.code);
+      setMyId(s.id || '');
+      setLobby(lobbyData);
+      setPlayerData(pd);
+      setGameResults(gr);
+      setScreen('lobby');
+      setIsConnecting(false);
+      setIsReconnecting(false);
+      setError(null);
+      showToast('Reconnected to the game!');
     });
 
     s.on('lobby-updated', (lobbyData) => {
       setLobby(lobbyData);
-      // If phase went back to waiting, reset game state
       if (lobbyData.phase === 'waiting') {
         setPlayerData(null);
         setGameResults(null);
@@ -89,6 +175,21 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
 
     s.on('player-left', ({ lobby: lobbyData }) => {
       setLobby(lobbyData);
+    });
+
+    s.on('player-disconnected', ({ playerName, lobby: lobbyData }) => {
+      setLobby(lobbyData);
+      showToast(`${playerName} lost connection — waiting for them to rejoin...`);
+    });
+
+    s.on('player-reconnected', ({ playerName, lobby: lobbyData }) => {
+      setLobby(lobbyData);
+      showToast(`${playerName} reconnected!`);
+    });
+
+    s.on('host-changed', ({ newHostName, lobby: lobbyData }) => {
+      setLobby(lobbyData);
+      showToast(`${newHostName} is now the host`);
     });
 
     s.on('settings-phase', (lobbyData) => {
@@ -121,6 +222,7 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
 
     s.on('player-kicked', ({ playerId }) => {
       if (playerId === s.id) {
+        clearSession();
         setLobby(null);
         setScreen('join');
         setError('You were kicked from the lobby.');
@@ -130,19 +232,47 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
     s.on('error', (message) => {
       setError(message);
       setIsConnecting(false);
+      setIsReconnecting(false);
     });
 
-    s.on('disconnect', () => {
-      console.log('Disconnected from server');
+    s.on('disconnect', (reason) => {
+      console.log('Disconnected from server:', reason);
+      if (reason !== 'io client disconnect') {
+        // Unintentional disconnect — show reconnecting state
+        showToast('Connection lost — reconnecting...');
+        reconnectAttempted.current = false; // allow auto-rejoin on reconnect
+      }
     });
-  }, []);
 
+    // ---- Chat listeners ----
+    s.on('chat-message', (msg: ChatMessage) => {
+      setMessages(prev => [...prev, msg]);
+      if (!isChatOpenRef.current) {
+        setUnreadCount(prev => prev + 1);
+      }
+    });
+
+    s.on('chat-history', (history: ChatMessage[]) => {
+      setMessages(history);
+      setUnreadCount(0);
+    });
+  }, [saveSession, clearSession, showToast]);
+
+  // On mount, check if there's a saved session and try to auto-reconnect
   useEffect(() => {
+    const session = getSession();
+    if (session && !socket) {
+      setIsReconnecting(true);
+      const s = connectSocket();
+      setSocket(s);
+      setupListeners(s);
+    }
+
     return () => {
-      // Cleanup on unmount
       listenersSetup.current = false;
       disconnectSocket();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const ensureConnected = useCallback((): GameSocket => {
@@ -151,7 +281,6 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
       s = connectSocket();
       setSocket(s);
       setupListeners(s);
-      // Set ID once connected
       if (s.id) setMyId(s.id);
       s.on('connect', () => {
         setMyId(s!.id || '');
@@ -165,8 +294,9 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const handleCreateLobby = (playerName: string) => {
     setIsConnecting(true);
     setError(null);
+    reconnectAttempted.current = true; // don't auto-rejoin old session
+    clearSession();
     const s = ensureConnected();
-    // Wait a tick for connection
     const emit = () => s.emit('create-lobby', playerName);
     if (s.connected) {
       emit();
@@ -178,8 +308,23 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const handleJoinLobby = (code: string, playerName: string) => {
     setIsConnecting(true);
     setError(null);
+    reconnectAttempted.current = true;
+    clearSession();
     const s = ensureConnected();
     const emit = () => s.emit('join-lobby', { code, playerName });
+    if (s.connected) {
+      emit();
+    } else {
+      s.once('connect', emit);
+    }
+  };
+
+  const handleRejoinLobby = (code: string, playerName: string) => {
+    setIsConnecting(true);
+    setError(null);
+    reconnectAttempted.current = true;
+    const s = ensureConnected();
+    const emit = () => s.emit('rejoin-lobby', { code, playerName });
     if (s.connected) {
       emit();
     } else {
@@ -190,6 +335,7 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const handleLeaveLobby = () => {
     voice.cleanupAll();
     socket?.emit('leave-lobby');
+    clearSession();
     setLobby(null);
     setPlayerData(null);
     setGameResults(null);
@@ -197,6 +343,13 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
     setHasVoted(false);
     setVotedCount(0);
     setError(null);
+    setMessages([]);
+    setIsChatOpen(false);
+    setUnreadCount(0);
+  };
+
+  const handleSendMessage = (text: string) => {
+    socket?.emit('send-message', text);
   };
 
   const handleStartSettings = () => {
@@ -229,6 +382,7 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
     handleLeaveLobby();
     disconnectSocket();
     listenersSetup.current = false;
+    reconnectAttempted.current = false;
     setSocket(null);
     onBack();
   };
@@ -250,124 +404,165 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
     />
   ) : null;
 
-  // ---- Start voting (host emits to server, server changes phase) ----
   const handleStartVoting = () => {
-    // For simplicity, we directly change phase via socket
-    // We'll add a simple event for this
     if (lobby && socket) {
-      // Emit a custom start-voting event - we handle it by changing lobby phase on server
-      // For now, we handle conversation->voting transition on server side
-      // We need to add this event. Let's handle it client side for the conversation phase
-      // Actually the server doesn't have this event, so let's just send it as a signal
-      // We'll use a workaround: the host can emit 'cast-vote' to trigger transition
-      // Better: let's just change the lobby phase directly by having the server listen for it
-      
-      // Since we didn't add a start-voting event on server, we handle this with a trick:
-      // We temporarily emit a non-existing event and handle it with our pattern
-      // Actually, let's just have the conversation end automatically. 
-      // For a quick solution, let's treat this on the client and sync via lobby update.
-      
-      // Simplest approach: we'll add the event handling
       // @ts-expect-error - custom event
       socket.emit('start-voting');
     }
   };
 
+  // ---- Toast notification ----
+  const toastEl = toast ? (
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-gray-900 text-white px-5 py-3 rounded-xl shadow-lg text-sm font-medium animate-fade-in max-w-sm text-center">
+      {toast}
+    </div>
+  ) : null;
+
+  // ---- Reconnecting overlay ----
+  if (isReconnecting && !lobby) {
+    return (
+      <>
+        {toastEl}
+        <div className="dialog-panel p-8 animate-slide-up text-center">
+          <div className="text-4xl mb-4 animate-bounce">🔄</div>
+          <h2 className="section-title text-xl mb-2">Reconnecting...</h2>
+          <p className="text-gray-500 text-sm mb-6">Trying to rejoin your game session</p>
+          <button
+            onClick={() => {
+              setIsReconnecting(false);
+              clearSession();
+              reconnectAttempted.current = true;
+            }}
+            className="btn-cartoon w-full py-3 text-gray-500 hover:text-gray-700 border-2 border-gray-200 hover:border-gray-300"
+          >
+            Cancel &amp; Go to Join Screen
+          </button>
+        </div>
+      </>
+    );
+  }
+
   // ---- Render ----
 
   if (screen === 'join' || !lobby) {
     return (
-      <OnlineLobbyJoin
-        onCreateLobby={handleCreateLobby}
-        onJoinLobby={handleJoinLobby}
-        onBack={handleBackToModes}
-        error={error}
-        isConnecting={isConnecting}
-      />
+      <>
+        {toastEl}
+        <OnlineLobbyJoin
+          onCreateLobby={handleCreateLobby}
+          onJoinLobby={handleJoinLobby}
+          onRejoinLobby={handleRejoinLobby}
+          onBack={handleBackToModes}
+          error={error}
+          isConnecting={isConnecting}
+        />
+      </>
     );
   }
 
   // Render based on lobby phase
-  switch (lobby.phase) {
-    case 'waiting':
-      return (
-        <OnlineWaitingRoom
-          lobby={lobby}
-          myId={myId}
-          onStartSettings={handleStartSettings}
-          onLeaveLobby={handleLeaveLobby}
-          onKickPlayer={handleKickPlayer}
-        />
-      );
-
-    case 'settings':
-      return (
-        <>
-          {voiceChatBar}
-          <OnlineSettings
+  const renderPhase = () => {
+    switch (lobby.phase) {
+      case 'waiting':
+        return (
+          <OnlineWaitingRoom
             lobby={lobby}
             myId={myId}
-            onStartGame={handleStartGame}
-          />
-        </>
-      );
-
-    case 'reveal':
-      if (!playerData) return null;
-      return (
-        <>
-          {voiceChatBar}
-          <OnlineWordReveal
-            lobby={lobby}
-            myId={myId}
-            playerData={playerData}
-            onRevealed={handleWordRevealed}
-          />
-        </>
-      );
-
-    case 'conversation':
-      return (
-        <>
-          {voiceChatBar}
-          <OnlineConversation
-            lobby={lobby}
-            myId={myId}
-            onStartVoting={handleStartVoting}
-          />
-        </>
-      );
-
-    case 'voting':
-      return (
-        <>
-          {voiceChatBar}
-          <OnlineVoting
-            lobby={lobby}
-            myId={myId}
-            hasVoted={hasVoted}
-            votedCount={votedCount}
-            onVote={handleVote}
-          />
-        </>
-      );
-
-    case 'result':
-      if (!gameResults) return null;
-      return (
-        <>
-          {voiceChatBar}
-          <OnlineResult
-            lobby={lobby}
-            myId={myId}
-            results={gameResults}
-            onNewGame={handleNewGame}
+            onStartSettings={handleStartSettings}
             onLeaveLobby={handleLeaveLobby}
+            onKickPlayer={handleKickPlayer}
           />
-        </>
-      );
+        );
 
-    default:
-      return null;
-  }
+      case 'settings':
+        return (
+          <>
+            {voiceChatBar}
+            <OnlineSettings
+              lobby={lobby}
+              myId={myId}
+              onStartGame={handleStartGame}
+            />
+          </>
+        );
+
+      case 'reveal':
+        if (!playerData) return null;
+        return (
+          <>
+            {voiceChatBar}
+            <OnlineWordReveal
+              lobby={lobby}
+              myId={myId}
+              playerData={playerData}
+              onRevealed={handleWordRevealed}
+            />
+          </>
+        );
+
+      case 'conversation':
+        return (
+          <>
+            {voiceChatBar}
+            <OnlineConversation
+              lobby={lobby}
+              myId={myId}
+              onStartVoting={handleStartVoting}
+            />
+          </>
+        );
+
+      case 'voting':
+        return (
+          <>
+            {voiceChatBar}
+            <OnlineVoting
+              lobby={lobby}
+              myId={myId}
+              hasVoted={hasVoted}
+              votedCount={votedCount}
+              onVote={handleVote}
+            />
+          </>
+        );
+
+      case 'result':
+        if (!gameResults) return null;
+        return (
+          <>
+            {voiceChatBar}
+            <OnlineResult
+              lobby={lobby}
+              myId={myId}
+              results={gameResults}
+              onNewGame={handleNewGame}
+              onLeaveLobby={handleLeaveLobby}
+            />
+          </>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  const chatPanel = lobby ? (
+    <ChatPanel
+      messages={messages}
+      onSendMessage={handleSendMessage}
+      myId={myId}
+      players={lobby.players.map(p => ({ id: p.id, name: p.name }))}
+      isOpen={isChatOpen}
+      onToggle={() => setIsChatOpen(prev => !prev)}
+      unreadCount={unreadCount}
+    />
+  ) : null;
+
+  return (
+    <>
+      {toastEl}
+      {renderPhase()}
+      {chatPanel}
+    </>
+  );
 }

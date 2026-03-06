@@ -26,14 +26,46 @@ interface VoiceChatBarProps {
 // Hidden audio elements to play remote streams
 function RemoteAudio({ stream }: { stream: MediaStream }) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.srcObject = stream;
-    }
+    const audioEl = audioRef.current;
+    if (!audioEl) return;
+
+    audioEl.srcObject = stream;
+    audioEl.volume = 1.0;
+
+    // Explicitly play — some browsers block autoPlay
+    const tryPlay = () => {
+      audioEl.play().catch((err) => {
+        console.warn('Audio autoplay blocked, retrying on user gesture:', err);
+        // Retry on next user interaction (tap/click anywhere)
+        const handler = () => {
+          audioEl.play().catch(() => {});
+          document.removeEventListener('click', handler);
+          document.removeEventListener('touchstart', handler);
+        };
+        document.addEventListener('click', handler, { once: true });
+        document.addEventListener('touchstart', handler, { once: true });
+      });
+    };
+
+    tryPlay();
+
+    // Also retry when new tracks are added to the stream
+    const onTrackAdded = () => {
+      if (retryRef.current) clearTimeout(retryRef.current);
+      retryRef.current = setTimeout(tryPlay, 200);
+    };
+    stream.addEventListener('addtrack', onTrackAdded);
+
+    return () => {
+      stream.removeEventListener('addtrack', onTrackAdded);
+      if (retryRef.current) clearTimeout(retryRef.current);
+    };
   }, [stream]);
 
-  return <audio ref={audioRef} autoPlay playsInline />;
+  return <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />;
 }
 
 export default function VoiceChatBar({

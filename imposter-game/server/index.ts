@@ -103,9 +103,26 @@ interface ServerLobby extends LobbyState {
   playerSocketMap: { [socketId: string]: string }; // socket id -> player name
 }
 
+// Stores info about disconnected players so they can rejoin within a timeout
+interface DisconnectedPlayer {
+  name: string;
+  lobbyCode: string;
+  wasHost: boolean;
+  isImposter: boolean;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
 const lobbies: Map<string, ServerLobby> = new Map();
 const socketToLobby: Map<string, string> = new Map(); // socketId -> lobbyCode
 const voiceRooms: Map<string, Set<string>> = new Map(); // lobbyCode -> Set<socketId>
+const disconnectedPlayers: Map<string, DisconnectedPlayer> = new Map(); // "lobbyCode:playerName" -> info
+const chatHistory: Map<string, Array<{ id: string; senderId: string; senderName: string; text: string; timestamp: number; type: 'player' | 'system' }>> = new Map(); // lobbyCode -> messages
+
+const MAX_CHAT_HISTORY = 100;
+let chatMsgCounter = 0;
+function nextChatId(): string { return `msg_${++chatMsgCounter}_${Date.now()}`; }
+
+const REJOIN_TIMEOUT_MS = 60_000; // 60 seconds to rejoin
 
 function generateLobbyCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // removed confusing chars I,O,0,1
@@ -147,10 +164,14 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
     origin: (origin, callback) => {
       // Allow requests with no origin (mobile apps, Postman, etc.)
       if (!origin) return callback(null, true);
-      // Allow any .vercel.app domain or explicitly listed origins
+      // Allow any .vercel.app, .devtunnels.ms, or .onrender.com domain, or explicitly listed origins
       if (
         allowedOrigins.includes(origin) ||
-        origin.endsWith('.vercel.app')
+        origin.endsWith('.vercel.app') ||
+        origin.endsWith('.devtunnels.ms') ||
+        origin.endsWith('.onrender.com') ||
+        origin.endsWith('.imposter.ninja') ||
+        origin === 'https://imposter.ninja'
       ) {
         return callback(null, true);
       }
@@ -217,17 +238,25 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Check if this player is reconnecting (name exists but marked disconnected)
+    const dcKey = `${upperCode}:${playerName.toLowerCase()}`;
+    const dcInfo = disconnectedPlayers.get(dcKey);
+    if (dcInfo) {
+      // This is a rejoin during waiting phase — handle it via rejoin path
+      return handleRejoin(socket, upperCode, playerName, dcKey, dcInfo, lobby);
+    }
+
     if (lobby.phase !== 'waiting') {
-      socket.emit('error', 'Game already in progress. Cannot join now.');
+      socket.emit('error', 'Game already in progress. Use "Rejoin" with the same name to reconnect.');
       return;
     }
 
-    if (lobby.players.length >= 12) {
+    if (lobby.players.filter(p => !p.isDisconnected).length >= 12) {
       socket.emit('error', 'Lobby is full (max 12 players).');
       return;
     }
 
-    if (lobby.players.some(p => p.name.toLowerCase() === playerName.toLowerCase())) {
+    if (lobby.players.some(p => p.name.toLowerCase() === playerName.toLowerCase() && !p.isDisconnected)) {
       socket.emit('error', 'A player with that name already exists in this lobby.');
       return;
     }
@@ -242,6 +271,7 @@ io.on('connection', (socket) => {
       isReady: false,
       hasRevealedWord: false,
       hasVoted: false,
+      isDisconnected: false,
     };
 
     lobby.players.push(player);
@@ -250,9 +280,214 @@ io.on('connection', (socket) => {
     socket.join(upperCode);
 
     socket.emit('lobby-joined', { lobby: getPublicLobby(lobby), playerId: socket.id });
+    // Send chat history to the joining player
+    const history = chatHistory.get(upperCode) || [];
+    if (history.length > 0) socket.emit('chat-history', history);
     socket.to(upperCode).emit('player-joined', { player, lobby: getPublicLobby(lobby) });
     console.log(`➕ ${playerName} joined lobby ${upperCode}`);
   });
+
+  // ---- REJOIN LOBBY (reconnect after accidental disconnect) ----
+  socket.on('rejoin-lobby', ({ code, playerName }) => {
+    const upperCode = code.toUpperCase();
+    const lobby = lobbies.get(upperCode);
+
+    if (!lobby) {
+      socket.emit('error', 'Lobby no longer exists.');
+      return;
+    }
+
+    const dcKey = `${upperCode}:${playerName.toLowerCase()}`;
+    const dcInfo = disconnectedPlayers.get(dcKey);
+
+    if (!dcInfo) {
+      // No disconnected record — if lobby is in waiting phase, just join as a new player
+      if (lobby.phase === 'waiting') {
+        // Check if a disconnected slot with this name exists (timeout expired but slot still there)
+        const existingSlot = lobby.players.find(
+          p => p.name.toLowerCase() === playerName.toLowerCase()
+        );
+        if (existingSlot) {
+          // Remove the stale slot and add fresh
+          lobby.players = lobby.players.filter(p => p.id !== existingSlot.id);
+          delete lobby.playerSocketMap[existingSlot.id];
+          socketToLobby.delete(existingSlot.id);
+          if (lobby.hostId === existingSlot.id) {
+            // Will reassign host below
+          }
+        }
+
+        // Check name uniqueness against remaining players
+        const nameTaken = lobby.players.some(
+          p => p.name.toLowerCase() === playerName.toLowerCase()
+        );
+        if (nameTaken) {
+          socket.emit('error', 'That name is already taken in this lobby.');
+          return;
+        }
+
+        // Check max players
+        if (lobby.players.length >= 20) {
+          socket.emit('error', 'Lobby is full (max 20 players).');
+          return;
+        }
+
+        // Leave any existing lobby
+        cleanupPlayer(socket.id);
+
+        const isNewHost = lobby.players.length === 0;
+        const player: LobbyPlayer = {
+          id: socket.id,
+          name: playerName,
+          isHost: isNewHost,
+          isReady: false,
+          hasRevealedWord: false,
+          hasVoted: false,
+          isDisconnected: false,
+        };
+        if (isNewHost) lobby.hostId = socket.id;
+
+        lobby.players.push(player);
+        lobby.playerSocketMap[socket.id] = playerName;
+        socketToLobby.set(socket.id, upperCode);
+        socket.join(upperCode);
+
+        socket.emit('lobby-joined', { lobby: getPublicLobby(lobby), playerId: socket.id });
+        const history = chatHistory.get(upperCode) || [];
+        if (history.length > 0) socket.emit('chat-history', history);
+        socket.to(upperCode).emit('player-joined', { player, lobby: getPublicLobby(lobby) });
+        console.log(`🔄➕ ${playerName} rejoin-fallback joined lobby ${upperCode} (waiting phase)`);
+        return;
+      } else {
+        socket.emit('error', 'Your 60-second rejoin window has expired. The game is still in progress — ask the host to start a new round.');
+      }
+      return;
+    }
+
+    handleRejoin(socket, upperCode, playerName, dcKey, dcInfo, lobby);
+  });
+
+  // Shared rejoin logic
+  function handleRejoin(
+    sock: typeof socket,
+    upperCode: string,
+    playerName: string,
+    dcKey: string,
+    dcInfo: DisconnectedPlayer,
+    lobby: ServerLobby
+  ) {
+    // Clear the disconnect timeout
+    clearTimeout(dcInfo.timeout);
+    disconnectedPlayers.delete(dcKey);
+
+    // Leave any existing lobby
+    cleanupPlayer(sock.id);
+
+    // Find the placeholder player slot and replace it with the new socket
+    const existingPlayer = lobby.players.find(
+      p => p.name.toLowerCase() === playerName.toLowerCase() && p.isDisconnected
+    );
+
+    if (existingPlayer) {
+      // Replace old socket id with new one
+      const oldId = existingPlayer.id;
+      delete lobby.playerSocketMap[oldId];
+
+      // Update vote references if they had voted (update the key)
+      if (lobby.votes[oldId]) {
+        lobby.votes[sock.id] = lobby.votes[oldId];
+        delete lobby.votes[oldId];
+      }
+      // Update any votes that point TO the old id
+      Object.keys(lobby.votes).forEach(voterId => {
+        if (lobby.votes[voterId] === oldId) {
+          lobby.votes[voterId] = sock.id;
+        }
+      });
+
+      // Update imposter ids
+      const impIdx = lobby.imposterIds.indexOf(oldId);
+      if (impIdx !== -1) {
+        lobby.imposterIds[impIdx] = sock.id;
+      }
+
+      existingPlayer.id = sock.id;
+      existingPlayer.isDisconnected = false;
+
+      // Restore host if they were host
+      if (dcInfo.wasHost) {
+        // Remove host from whoever currently has it and give it back
+        lobby.players.forEach(p => { p.isHost = false; });
+        existingPlayer.isHost = true;
+        lobby.hostId = sock.id;
+      }
+    } else {
+      // Player slot was removed (shouldn't happen but handle gracefully)
+      const player: LobbyPlayer = {
+        id: sock.id,
+        name: playerName,
+        isHost: false,
+        isReady: false,
+        hasRevealedWord: false,
+        hasVoted: false,
+        isDisconnected: false,
+      };
+      lobby.players.push(player);
+    }
+
+    lobby.playerSocketMap[sock.id] = playerName;
+    socketToLobby.set(sock.id, upperCode);
+    sock.join(upperCode);
+
+    // Send the rejoining player their full game state
+    const isImposter = lobby.imposterIds.includes(sock.id);
+    let playerData: PlayerGameData | null = null;
+    let gameResults: GameResults | null = null;
+
+    if (lobby.phase !== 'waiting') {
+      playerData = {
+        isImposter,
+        word: isImposter ? null : lobby.word,
+        hint: isImposter && lobby.settings?.useHintForImposter ? lobby.hint : null,
+      };
+    }
+
+    if (lobby.phase === 'result' && lobby.word) {
+      // Reconstruct results
+      const voteCount: { [id: string]: number } = {};
+      Object.values(lobby.votes).forEach(votedId => {
+        voteCount[votedId] = (voteCount[votedId] || 0) + 1;
+      });
+      const maxVotes = Math.max(...Object.values(voteCount), 0);
+      const mostVotedPlayers = Object.keys(voteCount).filter(id => voteCount[id] === maxVotes);
+      const imposterCaught = mostVotedPlayers.some(id => lobby.imposterIds.includes(id));
+
+      gameResults = {
+        votes: lobby.votes,
+        imposterIds: lobby.imposterIds,
+        word: lobby.word,
+        impostersWin: !imposterCaught,
+      };
+    }
+
+    sock.emit('rejoined-game', {
+      lobby: getPublicLobby(lobby),
+      playerData,
+      gameResults,
+    });
+    // Send chat history to the rejoining player
+    const chatHist = chatHistory.get(upperCode) || [];
+    if (chatHist.length > 0) sock.emit('chat-history', chatHist);
+
+    // Notify others
+    sock.to(upperCode).emit('player-reconnected', {
+      playerId: sock.id,
+      playerName,
+      lobby: getPublicLobby(lobby),
+    });
+
+    console.log(`🔄 ${playerName} rejoined lobby ${upperCode} (phase: ${lobby.phase})`);
+  }
 
   // ---- LEAVE LOBBY ----
   socket.on('leave-lobby', () => {
@@ -375,50 +610,51 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Can't vote for a disconnected player
+    const votedForPlayer = lobby.players.find(p => p.id === votedForId);
+    if (!votedForPlayer) {
+      socket.emit('error', 'Invalid player selected.');
+      return;
+    }
+
     lobby.votes[socket.id] = votedForId;
     player.hasVoted = true;
 
-    const votedCount = Object.keys(lobby.votes).length;
+    const activePlayers = lobby.players.filter(p => !p.isDisconnected);
+    const votedCount = activePlayers.filter(p => p.hasVoted).length;
     io.to(lobby.code).emit('vote-update', {
       votedCount,
-      totalPlayers: lobby.players.length,
+      totalPlayers: activePlayers.length,
     });
 
-    // Check if all players voted
-    if (votedCount === lobby.players.length) {
-      // Calculate results
-      lobby.phase = 'result';
-
-      // Count votes per player
-      const voteCount: { [id: string]: number } = {};
-      Object.values(lobby.votes).forEach(votedId => {
-        voteCount[votedId] = (voteCount[votedId] || 0) + 1;
-      });
-
-      // Find most voted player(s)
-      const maxVotes = Math.max(...Object.values(voteCount), 0);
-      const mostVotedPlayers = Object.keys(voteCount).filter(id => voteCount[id] === maxVotes);
-
-      // Imposters win if no imposter was in the most voted
-      const imposterCaught = mostVotedPlayers.some(id => lobby.imposterIds.includes(id));
-      const impostersWin = !imposterCaught;
-
-      const results: GameResults = {
-        votes: lobby.votes,
-        imposterIds: lobby.imposterIds,
-        word: lobby.word!,
-        impostersWin,
-      };
-
-      io.to(lobby.code).emit('game-results', results);
-      io.to(lobby.code).emit('phase-changed', getPublicLobby(lobby));
-    }
+    // Check if all active (connected) players voted
+    checkAllVoted(lobby);
   });
 
   // ---- HOST: NEW GAME ----
   socket.on('new-game', () => {
     const lobby = getLobbyForSocket(socket.id);
     if (!lobby || lobby.hostId !== socket.id) return;
+
+    // Remove disconnected players permanently on new game
+    const dcPlayers = lobby.players.filter(p => p.isDisconnected);
+    dcPlayers.forEach(p => {
+      const dcKey = `${lobby.code}:${p.name.toLowerCase()}`;
+      const dcInfo = disconnectedPlayers.get(dcKey);
+      if (dcInfo) {
+        clearTimeout(dcInfo.timeout);
+        disconnectedPlayers.delete(dcKey);
+      }
+      delete lobby.playerSocketMap[p.id];
+      socketToLobby.delete(p.id);
+    });
+    lobby.players = lobby.players.filter(p => !p.isDisconnected);
+
+    if (lobby.players.length === 0) {
+      lobbies.delete(lobby.code);
+      chatHistory.delete(lobby.code);
+      return;
+    }
 
     lobby.phase = 'waiting';
     lobby.settings = null;
@@ -432,6 +668,7 @@ io.on('connection', (socket) => {
     lobby.players.forEach(p => {
       p.hasRevealedWord = false;
       p.hasVoted = false;
+      p.isDisconnected = false;
     });
 
     io.to(lobby.code).emit('lobby-updated', getPublicLobby(lobby));
@@ -458,6 +695,38 @@ io.on('connection', (socket) => {
 
     io.to(lobby.code).emit('player-left', { playerId, lobby: getPublicLobby(lobby) });
     console.log(`🚫 ${kickedPlayer.name} kicked from lobby ${lobby.code}`);
+  });
+
+  // ======= Text Chat =======
+
+  socket.on('send-message', (text: string) => {
+    if (!text || typeof text !== 'string') return;
+    const trimmed = text.trim().slice(0, 500); // max 500 chars
+    if (!trimmed) return;
+
+    const lobby = getLobbyForSocket(socket.id);
+    if (!lobby) return;
+
+    const player = lobby.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    const msg = {
+      id: nextChatId(),
+      senderId: socket.id,
+      senderName: player.name,
+      text: trimmed,
+      timestamp: Date.now(),
+      type: 'player' as const,
+    };
+
+    // Store in history
+    if (!chatHistory.has(lobby.code)) chatHistory.set(lobby.code, []);
+    const history = chatHistory.get(lobby.code)!;
+    history.push(msg);
+    if (history.length > MAX_CHAT_HISTORY) history.shift();
+
+    // Broadcast to entire lobby
+    io.to(lobby.code).emit('chat-message', msg);
   });
 
   // ======= WebRTC Voice Chat Signaling =======
@@ -519,6 +788,7 @@ io.on('connection', (socket) => {
   // ---- DISCONNECT ----
   socket.on('disconnect', () => {
     console.log(`❌ Player disconnected: ${socket.id}`);
+
     // Remove from voice rooms
     voiceRooms.forEach((members, code) => {
       if (members.has(socket.id)) {
@@ -527,7 +797,9 @@ io.on('connection', (socket) => {
         if (members.size === 0) voiceRooms.delete(code);
       }
     });
-    cleanupPlayer(socket.id);
+
+    // Handle lobby disconnect with rejoin support
+    handlePlayerDisconnect(socket.id);
   });
 
   // ======= Helper Functions =======
@@ -538,6 +810,84 @@ io.on('connection', (socket) => {
     return lobbies.get(code) || null;
   }
 
+  // Called on socket disconnect — marks player as disconnected with a rejoin timeout
+  function handlePlayerDisconnect(socketId: string) {
+    const code = socketToLobby.get(socketId);
+    if (!code) return;
+
+    const lobby = lobbies.get(code);
+    if (!lobby) {
+      socketToLobby.delete(socketId);
+      return;
+    }
+
+    const leavingPlayer = lobby.players.find(p => p.id === socketId);
+    if (!leavingPlayer) {
+      socketToLobby.delete(socketId);
+      return;
+    }
+
+    // Keep player slot for rejoin in ALL phases (including waiting)
+    leavingPlayer.isDisconnected = true;
+    socketToLobby.delete(socketId);
+
+    const pSocket = io.sockets.sockets.get(socketId);
+    if (pSocket) pSocket.leave(code);
+
+    const dcKey = `${code}:${leavingPlayer.name.toLowerCase()}`;
+
+    // If host disconnected, assign temporary host to someone still connected
+    let hostChanged = false;
+    if (lobby.hostId === socketId) {
+      const connectedPlayer = lobby.players.find(p => !p.isDisconnected && p.id !== socketId);
+      if (connectedPlayer) {
+        leavingPlayer.isHost = false;
+        connectedPlayer.isHost = true;
+        lobby.hostId = connectedPlayer.id;
+        hostChanged = true;
+        console.log(`👑 Temporary host in ${code}: ${connectedPlayer.name} (${leavingPlayer.name} disconnected)`);
+      }
+    }
+
+    // Set a timeout to permanently remove them if they don't rejoin
+    const timeout = setTimeout(() => {
+      disconnectedPlayers.delete(dcKey);
+      permanentlyRemovePlayer(code, leavingPlayer.name);
+    }, REJOIN_TIMEOUT_MS);
+
+    disconnectedPlayers.set(dcKey, {
+      name: leavingPlayer.name,
+      lobbyCode: code,
+      wasHost: lobby.hostId === socketId || (hostChanged && true),
+      isImposter: lobby.imposterIds.includes(socketId),
+      timeout,
+    });
+
+    // Notify remaining players
+    io.to(code).emit('player-disconnected', {
+      playerId: socketId,
+      playerName: leavingPlayer.name,
+      lobby: getPublicLobby(lobby),
+    });
+
+    if (hostChanged) {
+      const newHost = lobby.players.find(p => p.id === lobby.hostId);
+      io.to(code).emit('host-changed', {
+        newHostId: lobby.hostId,
+        newHostName: newHost?.name || 'Unknown',
+        lobby: getPublicLobby(lobby),
+      });
+    }
+
+    // If voting phase and this player hasn't voted, check if all remaining active players voted
+    if (lobby.phase === 'voting') {
+      checkAllVoted(lobby);
+    }
+
+    console.log(`⏸️ ${leavingPlayer.name} disconnected from lobby ${code} — has ${REJOIN_TIMEOUT_MS / 1000}s to rejoin`);
+  }
+
+  // Called on intentional leave (leave-lobby event) — always removes immediately
   function cleanupPlayer(socketId: string) {
     const code = socketToLobby.get(socketId);
     if (!code) return;
@@ -549,6 +899,17 @@ io.on('connection', (socket) => {
     }
 
     const leavingPlayer = lobby.players.find(p => p.id === socketId);
+
+    // Also clear any disconnect timer for this player
+    if (leavingPlayer) {
+      const dcKey = `${code}:${leavingPlayer.name.toLowerCase()}`;
+      const dcInfo = disconnectedPlayers.get(dcKey);
+      if (dcInfo) {
+        clearTimeout(dcInfo.timeout);
+        disconnectedPlayers.delete(dcKey);
+      }
+    }
+
     lobby.players = lobby.players.filter(p => p.id !== socketId);
     delete lobby.playerSocketMap[socketId];
     socketToLobby.delete(socketId);
@@ -557,23 +918,103 @@ io.on('connection', (socket) => {
     if (pSocket) pSocket.leave(code);
 
     if (lobby.players.length === 0) {
-      // Delete empty lobby
       lobbies.delete(code);
-      console.log(`🗑️ Lobby ${code} deleted (empty)`);
+      chatHistory.delete(code);
+      console.log(`\ud83d\uddd1\ufe0f Lobby ${code} deleted (empty)`);
       return;
     }
-
-    // If host left, assign new host
     if (lobby.hostId === socketId) {
-      const newHost = lobby.players[0];
-      lobby.hostId = newHost.id;
+      const connectedPlayer = lobby.players.find(p => !p.isDisconnected);
+      const newHost = connectedPlayer || lobby.players[0];
+      lobby.players.forEach(p => { p.isHost = false; });
       newHost.isHost = true;
+      lobby.hostId = newHost.id;
+
+      io.to(code).emit('host-changed', {
+        newHostId: newHost.id,
+        newHostName: newHost.name,
+        lobby: getPublicLobby(lobby),
+      });
       console.log(`👑 New host in ${code}: ${newHost.name}`);
     }
 
     io.to(code).emit('player-left', { playerId: socketId, lobby: getPublicLobby(lobby) });
     if (leavingPlayer) {
       console.log(`🚪 ${leavingPlayer.name} left lobby ${code}`);
+    }
+  }
+
+  // Permanently remove a player who didn't rejoin within the timeout
+  function permanentlyRemovePlayer(code: string, playerName: string) {
+    const lobby = lobbies.get(code);
+    if (!lobby) return;
+
+    const player = lobby.players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
+    if (!player) return;
+
+    const playerId = player.id;
+    lobby.players = lobby.players.filter(p => p.id !== playerId);
+    delete lobby.playerSocketMap[playerId];
+    socketToLobby.delete(playerId);
+
+    if (lobby.players.length === 0) {
+      lobbies.delete(code);
+      chatHistory.delete(code);
+      console.log(`🗑️ Lobby ${code} deleted (empty after timeout)`);
+      return;
+    }
+
+    // If this was the host, reassign
+    if (lobby.hostId === playerId) {
+      const connectedPlayer = lobby.players.find(p => !p.isDisconnected);
+      const newHost = connectedPlayer || lobby.players[0];
+      lobby.players.forEach(p => { p.isHost = false; });
+      newHost.isHost = true;
+      lobby.hostId = newHost.id;
+
+      io.to(code).emit('host-changed', {
+        newHostId: newHost.id,
+        newHostName: newHost.name,
+        lobby: getPublicLobby(lobby),
+      });
+    }
+
+    io.to(code).emit('player-left', { playerId, lobby: getPublicLobby(lobby) });
+
+    // If voting phase, recheck if all active players have voted
+    if (lobby.phase === 'voting') {
+      checkAllVoted(lobby);
+    }
+
+    console.log(`⏰ ${playerName} permanently removed from ${code} (rejoin timeout expired)`);
+  }
+
+  // Check if all connected (non-disconnected) players have voted
+  function checkAllVoted(lobby: ServerLobby) {
+    const activePlayers = lobby.players.filter(p => !p.isDisconnected);
+    const allVoted = activePlayers.every(p => p.hasVoted);
+
+    if (allVoted && activePlayers.length > 0) {
+      lobby.phase = 'result';
+
+      const voteCount: { [id: string]: number } = {};
+      Object.values(lobby.votes).forEach(votedId => {
+        voteCount[votedId] = (voteCount[votedId] || 0) + 1;
+      });
+
+      const maxVotes = Math.max(...Object.values(voteCount), 0);
+      const mostVotedPlayers = Object.keys(voteCount).filter(id => voteCount[id] === maxVotes);
+      const imposterCaught = mostVotedPlayers.some(id => lobby.imposterIds.includes(id));
+
+      const results: GameResults = {
+        votes: lobby.votes,
+        imposterIds: lobby.imposterIds,
+        word: lobby.word!,
+        impostersWin: !imposterCaught,
+      };
+
+      io.to(lobby.code).emit('game-results', results);
+      io.to(lobby.code).emit('phase-changed', getPublicLobby(lobby));
     }
   }
 });
