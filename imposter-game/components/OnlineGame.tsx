@@ -16,6 +16,7 @@ import OnlineWordReveal from './OnlineWordReveal';
 import OnlineConversation from './OnlineConversation';
 import OnlineVoting from './OnlineVoting';
 import OnlineResult from './OnlineResult';
+import ImposterGuessModal from './ImposterGuessModal';
 import VoiceChatBar from './VoiceChatBar';
 import ChatPanel from './ChatPanel';
 import { useVoiceChat } from '@/lib/useVoiceChat';
@@ -43,6 +44,7 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const [votedCount, setVotedCount] = useState(0);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [showImposterGuess, setShowImposterGuess] = useState(false);
 
   // Chat
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -218,6 +220,11 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
 
     s.on('game-results', (results) => {
       setGameResults(results);
+      setShowImposterGuess(false);
+    });
+
+    s.on('imposter-guess-prompt', () => {
+      setShowImposterGuess(true);
     });
 
     s.on('player-kicked', ({ playerId }) => {
@@ -367,6 +374,11 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const handleVote = (votedForId: string) => {
     socket?.emit('cast-vote', votedForId);
     setHasVoted(true);
+  };
+
+  const handleImposterGuess = (guess: string) => {
+    socket?.emit('imposter-guess', guess);
+    setShowImposterGuess(false);
   };
 
   const handleNewGame = () => {
@@ -523,6 +535,9 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
               votedCount={votedCount}
               onVote={handleVote}
             />
+            {showImposterGuess && (
+              <ImposterGuessModal onSubmitGuess={handleImposterGuess} />
+            )}
           </>
         );
 

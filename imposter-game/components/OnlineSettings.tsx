@@ -1,6 +1,6 @@
 'use client';
 
-import { LobbyState, LobbySettings } from '@/lib/onlineTypes';
+import { LobbyState, LobbySettings, Difficulty } from '@/lib/onlineTypes';
 import { useState } from 'react';
 import { DetectiveNarrator } from './CartoonElements';
 
@@ -10,7 +10,7 @@ interface OnlineSettingsProps {
   onStartGame: (settings: LobbySettings) => void;
 }
 
-const categories = [
+const presetCategories = [
   'Foods and Drinks',
   'Brands',
   'Daily Use Objects',
@@ -19,11 +19,21 @@ const categories = [
   'Countries',
 ];
 
+const difficulties: { value: Difficulty; label: string; emoji: string; desc: string }[] = [
+  { value: 'easy', label: 'Easy', emoji: '🟢', desc: 'Common words, obvious hints' },
+  { value: 'medium', label: 'Medium', emoji: '🟡', desc: 'Moderate words, vague hints' },
+  { value: 'hard', label: 'Hard', emoji: '🔴', desc: 'Obscure words, cryptic hints' },
+];
+
 export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSettingsProps) {
   const isHost = lobby.hostId === myId;
+  const [useCustomCategory, setUseCustomCategory] = useState(false);
+  const [customCategoryInput, setCustomCategoryInput] = useState('');
   const [settings, setSettings] = useState<LobbySettings>({
     numberOfImposters: 1,
-    category: categories[0],
+    category: presetCategories[0],
+    customCategory: '',
+    difficulty: 'medium',
     numberOfConversations: 2,
     useHintForImposter: false,
   });
@@ -31,7 +41,10 @@ export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSetti
   const maxImposters = Math.max(1, Math.floor(lobby.players.length / 3));
 
   const handleStart = () => {
-    onStartGame(settings);
+    onStartGame({
+      ...settings,
+      customCategory: useCustomCategory ? customCategoryInput.trim() : '',
+    });
   };
 
   if (!isHost) {
@@ -72,21 +85,90 @@ export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSetti
       {/* Category */}
       <div className="mb-5">
         <label className="section-title text-sm mb-3 block">📂 Category</label>
-        <div className="grid grid-cols-2 gap-2">
-          {categories.map((cat) => (
+
+        {/* Toggle: Preset vs Custom */}
+        <div className="flex gap-2 mb-3">
+          <button
+            onClick={() => setUseCustomCategory(false)}
+            className={`flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all ${
+              !useCustomCategory
+                ? 'bg-purple-500 text-white border-purple-600'
+                : 'bg-white text-gray-600 border-gray-200 hover:border-purple-300'
+            }`}
+          >
+            📋 Preset
+          </button>
+          <button
+            onClick={() => setUseCustomCategory(true)}
+            className={`flex-1 py-2 rounded-xl text-sm font-bold border-2 transition-all ${
+              useCustomCategory
+                ? 'bg-purple-500 text-white border-purple-600'
+                : 'bg-white text-gray-600 border-gray-200 hover:border-purple-300'
+            }`}
+          >
+            ✨ Custom (AI)
+          </button>
+        </div>
+
+        {useCustomCategory ? (
+          <div>
+            <input
+              type="text"
+              value={customCategoryInput}
+              onChange={(e) => setCustomCategoryInput(e.target.value)}
+              placeholder="e.g. Sri Lankan street food, 90s cartoons..."
+              className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl text-sm font-medium focus:border-purple-400 focus:outline-none"
+              maxLength={100}
+            />
+            <p className="text-xs text-gray-400 mt-1.5 ml-1">
+              🤖 AI will generate words for any topic you type
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2">
+            {presetCategories.map((cat) => (
+              <button
+                key={cat}
+                onClick={() => setSettings((s) => ({ ...s, category: cat }))}
+                className={`p-3 rounded-xl text-sm font-bold border-2 transition-all ${
+                  settings.category === cat
+                    ? 'bg-purple-500 text-white border-purple-600 shadow-lg scale-105'
+                    : 'bg-white text-gray-600 border-gray-200 hover:border-purple-300'
+                }`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Difficulty */}
+      <div className="mb-5">
+        <label className="section-title text-sm mb-3 block">🎯 Difficulty</label>
+        <div className="flex gap-2">
+          {difficulties.map((d) => (
             <button
-              key={cat}
-              onClick={() => setSettings((s) => ({ ...s, category: cat }))}
-              className={`p-3 rounded-xl text-sm font-bold border-2 transition-all ${
-                settings.category === cat
-                  ? 'bg-purple-500 text-white border-purple-600 shadow-lg scale-105'
-                  : 'bg-white text-gray-600 border-gray-200 hover:border-purple-300'
+              key={d.value}
+              onClick={() => setSettings((s) => ({ ...s, difficulty: d.value }))}
+              className={`flex-1 py-3 px-2 rounded-xl border-2 transition-all text-center ${
+                settings.difficulty === d.value
+                  ? d.value === 'easy'
+                    ? 'bg-green-500 text-white border-green-600 shadow-lg'
+                    : d.value === 'medium'
+                    ? 'bg-yellow-500 text-white border-yellow-600 shadow-lg'
+                    : 'bg-red-500 text-white border-red-600 shadow-lg'
+                  : 'bg-white text-gray-600 border-gray-200 hover:border-gray-300'
               }`}
             >
-              {cat}
+              <div className="text-lg">{d.emoji}</div>
+              <div className="text-xs font-bold mt-0.5">{d.label}</div>
             </button>
           ))}
         </div>
+        <p className="text-xs text-gray-400 mt-1.5 ml-1">
+          {difficulties.find((d) => d.value === settings.difficulty)?.desc}
+        </p>
       </div>
 
       {/* Number of Imposters */}
@@ -160,7 +242,8 @@ export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSetti
       {/* Start */}
       <button
         onClick={handleStart}
-        className="btn-cartoon btn-cartoon-success w-full py-4 text-xl"
+        disabled={useCustomCategory && !customCategoryInput.trim()}
+        className="btn-cartoon btn-cartoon-success w-full py-4 text-xl disabled:opacity-50 disabled:cursor-not-allowed"
       >
         🚀 Start Game!
       </button>

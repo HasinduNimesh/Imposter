@@ -126,6 +126,26 @@ export default function OnlineResult({
         </div>
       </div>
 
+      {/* Imposter Word Guess */}
+      {results.imposterGuess !== undefined && results.imposterGuess !== '' && (
+        <div
+          className={`rounded-xl p-4 mb-4 text-center border-2 ${
+            results.imposterGuessCorrect
+              ? 'bg-green-50 border-green-200'
+              : 'bg-red-50 border-red-200'
+          }`}
+        >
+          <p className="text-xs uppercase tracking-widest font-bold mb-1 text-gray-500">
+            Imposter&apos;s Word Guess
+          </p>
+          <p className={`text-xl font-black ${
+            results.imposterGuessCorrect ? 'text-green-600' : 'text-red-600'
+          }`}>
+            &quot;{results.imposterGuess}&quot; {results.imposterGuessCorrect ? '✅ Correct! (+20 pts)' : '❌ Wrong!'}
+          </p>
+        </div>
+      )}
+
       {/* Vote Results */}
       <div className="mb-6">
         <h3 className="section-title text-sm mb-3">🗳️ Vote Results</h3>
@@ -170,6 +190,77 @@ export default function OnlineResult({
               </div>
             );
           })}
+        </div>
+      </div>
+
+      {/* Round Points */}
+      {results.roundPoints && Object.keys(results.roundPoints).length > 0 && (
+        <div className="mb-4">
+          <h3 className="section-title text-sm mb-3">⭐ Points This Round</h3>
+          <div className="flex flex-wrap gap-2">
+            {lobby.players
+              .filter(p => (results.roundPoints[p.id] || 0) > 0)
+              .sort((a, b) => (results.roundPoints[b.id] || 0) - (results.roundPoints[a.id] || 0))
+              .map((player) => {
+                const pts = results.roundPoints[player.id] || 0;
+                const index = lobby.players.findIndex((p) => p.id === player.id);
+                return (
+                  <div
+                    key={player.id}
+                    className="flex items-center gap-2 bg-yellow-50 border-2 border-yellow-200 rounded-xl px-3 py-2"
+                  >
+                    <div
+                      className="player-avatar text-sm w-7 h-7"
+                      style={{ background: getPlayerColor(index) }}
+                    >
+                      {getPlayerAvatar(index)}
+                    </div>
+                    <span className="font-bold text-gray-700 text-sm">{player.name}</span>
+                    <span className="font-black text-yellow-600 text-sm">+{pts}</span>
+                  </div>
+                );
+              })}
+            {lobby.players.every(p => (results.roundPoints[p.id] || 0) === 0) && (
+              <p className="text-gray-400 text-sm">No points earned this round</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Scoreboard */}
+      <div className="mb-6">
+        <h3 className="section-title text-sm mb-3">🏆 Scoreboard</h3>
+        <div className="space-y-2">
+          {[...lobby.players]
+            .sort((a, b) => (b.score || 0) - (a.score || 0))
+            .map((player, rank) => {
+              const index = lobby.players.findIndex((p) => p.id === player.id);
+              const medal = rank === 0 ? '🥇' : rank === 1 ? '🥈' : rank === 2 ? '🥉' : '';
+              return (
+                <div
+                  key={player.id}
+                  className={`cartoon-card p-3 flex items-center gap-3 ${
+                    player.id === myId ? 'ring-2 ring-purple-300' : ''
+                  }`}
+                >
+                  <span className="text-lg w-8 text-center">{medal || `#${rank + 1}`}</span>
+                  <div
+                    className="player-avatar text-sm w-8 h-8"
+                    style={{ background: getPlayerColor(index) }}
+                  >
+                    {getPlayerAvatar(index)}
+                  </div>
+                  <span className="font-semibold text-gray-800 flex-1">
+                    {player.name}
+                    {player.id === myId && (
+                      <span className="text-xs text-purple-500 ml-1">(You)</span>
+                    )}
+                  </span>
+                  <span className="font-black text-purple-700 text-lg">{player.score || 0}</span>
+                  <span className="text-xs text-gray-400">pts</span>
+                </div>
+              );
+            })}
         </div>
       </div>
 

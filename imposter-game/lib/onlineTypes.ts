@@ -8,11 +8,16 @@ export interface LobbyPlayer {
   hasRevealedWord: boolean;
   hasVoted: boolean;
   isDisconnected?: boolean; // true when player temporarily disconnected
+  score: number; // cumulative points across rounds
 }
+
+export type Difficulty = 'easy' | 'medium' | 'hard';
 
 export interface LobbySettings {
   numberOfImposters: number;
   category: string;
+  customCategory: string;  // user-typed custom topic (empty = use preset category)
+  difficulty: Difficulty;
   numberOfConversations: number;
   useHintForImposter: boolean;
 }
@@ -48,6 +53,9 @@ export interface GameResults {
   imposterIds: string[];
   word: string;
   impostersWin: boolean;
+  roundPoints: { [playerId: string]: number }; // points earned this round
+  imposterGuess?: string; // what the imposter guessed
+  imposterGuessCorrect?: boolean; // whether the guess was correct
 }
 
 // Chat message
@@ -72,6 +80,7 @@ export interface ClientToServerEvents {
   'start-game': (settings: LobbySettings) => void;
   'word-revealed': () => void;
   'cast-vote': (votedForId: string) => void;
+  'imposter-guess': (guess: string) => void;
   'new-game': () => void;
   'kick-player': (playerId: string) => void;
   'send-message': (text: string) => void;
@@ -94,6 +103,7 @@ export interface ServerToClientEvents {
   'phase-changed': (lobby: LobbyState) => void;
   'vote-update': (data: { votedCount: number; totalPlayers: number }) => void;
   'game-results': (results: GameResults) => void;
+  'imposter-guess-prompt': () => void;
   'player-kicked': (data: { playerId: string }) => void;
   'chat-message': (message: ChatMessage) => void;
   'chat-history': (messages: ChatMessage[]) => void;

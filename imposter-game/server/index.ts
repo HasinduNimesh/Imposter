@@ -11,6 +11,7 @@ import type {
   GameResults,
   OnlinePhase,
 } from '../lib/onlineTypes';
+import { generateWords } from './wordGenerator';
 
 // ======= Word Database (duplicated for server-side use) =======
 interface WordItem { word: string; hint: string; }
@@ -101,6 +102,9 @@ interface ServerLobby extends LobbyState {
   imposterIds: string[];
   votes: { [playerId: string]: string };
   playerSocketMap: { [socketId: string]: string }; // socket id -> player name
+  imposterGuess: string | null; // the imposter's word guess
+  imposterGuessCorrect: boolean; // whether the guess was correct
+  awaitingImposterGuess: boolean; // waiting for imposter to submit guess
 }
 
 // Stores info about disconnected players so they can rejoin within a timeout
@@ -203,6 +207,7 @@ io.on('connection', (socket) => {
       isReady: false,
       hasRevealedWord: false,
       hasVoted: false,
+      score: 0,
     };
 
     const lobby: ServerLobby = {
@@ -218,6 +223,9 @@ io.on('connection', (socket) => {
       imposterIds: [],
       votes: {},
       playerSocketMap: { [socket.id]: playerName },
+      imposterGuess: null,
+      imposterGuessCorrect: false,
+      awaitingImposterGuess: false,
     };
 
     lobbies.set(code, lobby);
@@ -272,6 +280,7 @@ io.on('connection', (socket) => {
       hasRevealedWord: false,
       hasVoted: false,
       isDisconnected: false,
+      score: 0,
     };
 
     lobby.players.push(player);
@@ -344,6 +353,7 @@ io.on('connection', (socket) => {
           hasRevealedWord: false,
           hasVoted: false,
           isDisconnected: false,
+          score: 0,
         };
         if (isNewHost) lobby.hostId = socket.id;
 
@@ -431,6 +441,7 @@ io.on('connection', (socket) => {
         hasRevealedWord: false,
         hasVoted: false,
         isDisconnected: false,
+        score: 0,
       };
       lobby.players.push(player);
     }
@@ -467,6 +478,9 @@ io.on('connection', (socket) => {
         imposterIds: lobby.imposterIds,
         word: lobby.word,
         impostersWin: !imposterCaught,
+        roundPoints: {},
+        imposterGuess: lobby.imposterGuess || undefined,
+        imposterGuessCorrect: lobby.imposterGuessCorrect || undefined,
       };
     }
 
@@ -508,7 +522,7 @@ io.on('connection', (socket) => {
   });
 
   // ---- HOST: START GAME ----
-  socket.on('start-game', (settings: LobbySettings) => {
+  socket.on('start-game', async (settings: LobbySettings) => {
     const lobby = getLobbyForSocket(socket.id);
     if (!lobby || lobby.hostId !== socket.id) return;
 
@@ -518,14 +532,29 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Pick word
-    const category = settings.category;
-    const words = wordDatabase[category];
-    if (!words || words.length === 0) {
-      socket.emit('error', 'Invalid category selected.');
-      return;
+    // Determine which category to use for word generation
+    const useCustom = settings.customCategory && settings.customCategory.trim().length > 0;
+    const categoryForLLM = useCustom ? settings.customCategory.trim() : settings.category;
+    const difficulty = settings.difficulty || 'medium';
+
+    let wordItem: { word: string; hint: string } | null = null;
+
+    // Try LLM generation first
+    const generated = await generateWords(categoryForLLM, difficulty);
+    if (generated && generated.length > 0) {
+      wordItem = generated[Math.floor(Math.random() * generated.length)];
     }
-    const wordItem = words[Math.floor(Math.random() * words.length)];
+
+    // Fallback to static database if LLM fails or no custom category
+    if (!wordItem) {
+      const category = settings.category;
+      const words = wordDatabase[category];
+      if (!words || words.length === 0) {
+        socket.emit('error', 'Failed to generate words. Try a different category.');
+        return;
+      }
+      wordItem = words[Math.floor(Math.random() * words.length)];
+    }
 
     // Pick imposters
     const shuffledIds = lobby.players.map(p => p.id).sort(() => Math.random() - 0.5);
@@ -540,6 +569,9 @@ io.on('connection', (socket) => {
     lobby.votes = {};
     lobby.conversationRound = 1;
     lobby.totalRounds = settings.numberOfConversations;
+    lobby.imposterGuess = null;
+    lobby.imposterGuessCorrect = false;
+    lobby.awaitingImposterGuess = false;
 
     // Reset player states
     lobby.players.forEach(p => {
@@ -631,6 +663,24 @@ io.on('connection', (socket) => {
     checkAllVoted(lobby);
   });
 
+  // ---- IMPOSTER: GUESS THE WORD ----
+  socket.on('imposter-guess', (guess: string) => {
+    const lobby = getLobbyForSocket(socket.id);
+    if (!lobby || !lobby.awaitingImposterGuess) return;
+    if (!lobby.imposterIds.includes(socket.id)) return;
+
+    const normalizedGuess = (guess || '').trim().toLowerCase();
+    const normalizedWord = (lobby.word || '').trim().toLowerCase();
+    const isCorrect = normalizedGuess === normalizedWord;
+
+    lobby.imposterGuess = guess.trim();
+    lobby.imposterGuessCorrect = isCorrect;
+    lobby.awaitingImposterGuess = false;
+
+    // Now finalize with imposter caught = true (since we only prompt on catch)
+    finalizeResults(lobby, true);
+  });
+
   // ---- HOST: NEW GAME ----
   socket.on('new-game', () => {
     const lobby = getLobbyForSocket(socket.id);
@@ -664,11 +714,15 @@ io.on('connection', (socket) => {
     lobby.votes = {};
     lobby.conversationRound = 0;
     lobby.totalRounds = 0;
+    lobby.imposterGuess = null;
+    lobby.imposterGuessCorrect = false;
+    lobby.awaitingImposterGuess = false;
 
     lobby.players.forEach(p => {
       p.hasRevealedWord = false;
       p.hasVoted = false;
       p.isDisconnected = false;
+      // score is NOT reset — it persists across rounds
     });
 
     io.to(lobby.code).emit('lobby-updated', getPublicLobby(lobby));
@@ -995,8 +1049,6 @@ io.on('connection', (socket) => {
     const allVoted = activePlayers.every(p => p.hasVoted);
 
     if (allVoted && activePlayers.length > 0) {
-      lobby.phase = 'result';
-
       const voteCount: { [id: string]: number } = {};
       Object.values(lobby.votes).forEach(votedId => {
         voteCount[votedId] = (voteCount[votedId] || 0) + 1;
@@ -1006,16 +1058,66 @@ io.on('connection', (socket) => {
       const mostVotedPlayers = Object.keys(voteCount).filter(id => voteCount[id] === maxVotes);
       const imposterCaught = mostVotedPlayers.some(id => lobby.imposterIds.includes(id));
 
-      const results: GameResults = {
-        votes: lobby.votes,
-        imposterIds: lobby.imposterIds,
-        word: lobby.word!,
-        impostersWin: !imposterCaught,
-      };
-
-      io.to(lobby.code).emit('game-results', results);
-      io.to(lobby.code).emit('phase-changed', getPublicLobby(lobby));
+      if (imposterCaught) {
+        // Imposter was caught — give them a chance to guess the word
+        lobby.awaitingImposterGuess = true;
+        // Prompt each imposter to guess
+        lobby.imposterIds.forEach(id => {
+          io.to(id).emit('imposter-guess-prompt');
+        });
+      } else {
+        // Imposters win — finalize immediately
+        finalizeResults(lobby, imposterCaught);
+      }
     }
+  }
+
+  // Finalize the round results and award points
+  function finalizeResults(lobby: ServerLobby, imposterCaught: boolean) {
+    lobby.phase = 'result';
+    const roundPoints: { [playerId: string]: number } = {};
+
+    // Initialize all players with 0 points for this round
+    lobby.players.forEach(p => { roundPoints[p.id] = 0; });
+
+    // Innocent players who correctly voted for an imposter get +10
+    Object.entries(lobby.votes).forEach(([voterId, votedForId]) => {
+      if (!lobby.imposterIds.includes(voterId) && lobby.imposterIds.includes(votedForId)) {
+        roundPoints[voterId] = (roundPoints[voterId] || 0) + 10;
+      }
+    });
+
+    // Imposters who survived (not caught) get +15
+    if (!imposterCaught) {
+      lobby.imposterIds.forEach(id => {
+        roundPoints[id] = (roundPoints[id] || 0) + 15;
+      });
+    }
+
+    // Imposter correct word guess: +20
+    if (lobby.imposterGuessCorrect) {
+      lobby.imposterIds.forEach(id => {
+        roundPoints[id] = (roundPoints[id] || 0) + 20;
+      });
+    }
+
+    // Apply round points to cumulative scores
+    lobby.players.forEach(p => {
+      p.score = (p.score || 0) + (roundPoints[p.id] || 0);
+    });
+
+    const results: GameResults = {
+      votes: lobby.votes,
+      imposterIds: lobby.imposterIds,
+      word: lobby.word!,
+      impostersWin: !imposterCaught,
+      roundPoints,
+      imposterGuess: lobby.imposterGuess || undefined,
+      imposterGuessCorrect: lobby.imposterGuessCorrect || undefined,
+    };
+
+    io.to(lobby.code).emit('game-results', results);
+    io.to(lobby.code).emit('phase-changed', getPublicLobby(lobby));
   }
 });
 
