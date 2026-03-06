@@ -10,6 +10,7 @@ interface OnlineLobbyJoinProps {
   onBack: () => void;
   error: string | null;
   isConnecting: boolean;
+  pendingSession?: { code: string; name: string } | null;
 }
 
 export default function OnlineLobbyJoin({
@@ -19,11 +20,12 @@ export default function OnlineLobbyJoin({
   onBack,
   error,
   isConnecting,
+  pendingSession,
 }: OnlineLobbyJoinProps) {
-  const [tab, setTab] = useState<'create' | 'join' | 'rejoin'>('create');
-  const [playerName, setPlayerName] = useState('');
+  const [tab, setTab] = useState<'create' | 'join' | 'rejoin'>(pendingSession ? 'rejoin' : 'create');
+  const [playerName, setPlayerName] = useState(pendingSession?.name || '');
   const [lobbyCode, setLobbyCode] = useState('');
-  const [rejoinCode, setRejoinCode] = useState('');
+  const [rejoinCode, setRejoinCode] = useState(pendingSession?.code || '');
 
   const handleCreate = () => {
     if (playerName.trim()) {
@@ -162,7 +164,7 @@ export default function OnlineLobbyJoin({
           <div className="bg-amber-50 border-2 border-amber-200 rounded-xl p-4 mb-4">
             <p className="text-amber-700 text-sm">
               <strong>Lost connection?</strong> Enter the same name and room code you used before.
-              You have 60 seconds from when you disconnected to rejoin.
+              You can rejoin anytime while the game is active.
             </p>
           </div>
           <div className="mb-4">

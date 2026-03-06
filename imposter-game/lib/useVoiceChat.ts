@@ -9,6 +9,7 @@ interface PeerConnection {
   iceCandidateQueue: RTCIceCandidateInit[];
   remoteDescriptionSet: boolean;
   retryCount: number;
+  connectionEpoch: number; // incremented on retry to ignore stale signals
 }
 
 interface VoicePeer {
@@ -22,25 +23,8 @@ const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    // Free TURN servers for devices behind symmetric NATs (mobile networks etc.)
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
   ],
-  iceCandidatePoolSize: 4,
+  iceCandidatePoolSize: 2,
 };
 
 const MAX_PEER_RETRIES = 3;
@@ -155,6 +139,7 @@ export function useVoiceChat(
         iceCandidateQueue: [],
         remoteDescriptionSet: false,
         retryCount: 0,
+        connectionEpoch: Date.now(),
       };
 
       // Handle incoming remote tracks — use event.track directly (not event.streams[0])
@@ -218,22 +203,32 @@ export function useVoiceChat(
         if (state === 'failed') {
           // Retry the connection if under max retries
           const peer = peersRef.current.get(remoteId);
-          if (peer && peer.retryCount < MAX_PEER_RETRIES && localStreamRef.current) {
-            peer.retryCount++;
-            console.log(`Retrying connection to ${remoteId.slice(0, 6)} (attempt ${peer.retryCount})`);
+          if (peer && peer.pc === pc && peer.retryCount < MAX_PEER_RETRIES && localStreamRef.current) {
+            const nextRetry = peer.retryCount + 1;
+            console.log(`Retrying connection to ${remoteId.slice(0, 6)} (attempt ${nextRetry})`);
+            // Fully tear down the old connection first
+            pc.onconnectionstatechange = null;
+            pc.oniceconnectionstatechange = null;
+            pc.onicecandidate = null;
+            pc.ontrack = null;
             pc.close();
             peersRef.current.delete(remoteId);
             analysersRef.current.delete(remoteId);
 
-            // Retry after a short delay
+            // Retry after a delay
             setTimeout(() => {
               if (!localStreamRef.current || !socketRef.current) return;
               const newPeer = createPeerConnection(remoteId);
-              newPeer.retryCount = peer.retryCount;
+              newPeer.retryCount = nextRetry;
               initiateOffer(remoteId, newPeer);
-            }, RETRY_DELAY_MS);
-          } else {
+            }, RETRY_DELAY_MS * nextRetry); // increasing backoff
+          } else if (peer && peer.pc === pc) {
             // Give up — remove peer
+            pc.onconnectionstatechange = null;
+            pc.oniceconnectionstatechange = null;
+            pc.onicecandidate = null;
+            pc.ontrack = null;
+            pc.close();
             peersRef.current.delete(remoteId);
             analysersRef.current.delete(remoteId);
             setVoicePeers(prev => prev.filter(p => p.id !== remoteId));
@@ -241,8 +236,8 @@ export function useVoiceChat(
         } else if (state === 'disconnected') {
           // Wait briefly — might recover on its own
           setTimeout(() => {
-            if (pc.connectionState === 'disconnected') {
-              // Still disconnected — try ICE restart
+            const peer = peersRef.current.get(remoteId);
+            if (peer && peer.pc === pc && pc.connectionState === 'disconnected') {
               pc.restartIce();
             }
           }, 3000);
@@ -367,24 +362,24 @@ export function useVoiceChat(
       if (!localStreamRef.current) return;
 
       let peer = peersRef.current.get(data.fromId);
-      if (!peer) {
-        peer = createPeerConnection(data.fromId);
-      }
 
-      const offerCollision =
+      const offerCollision = peer && (
         makingOfferRef.current.has(data.fromId) ||
-        peer.pc.signalingState !== 'stable';
+        peer.pc.signalingState !== 'stable'
+      );
 
       // If we are the impolite peer and there's a collision, ignore the incoming offer
       if (offerCollision && !isPolite(data.fromId)) {
         return;
       }
 
+      // If there's a collision and we're polite, or the existing connection is in a bad state,
+      // create a fresh peer connection to avoid RTP extension remap errors
+      if (!peer || (offerCollision && peer.pc.signalingState !== 'stable')) {
+        peer = createPeerConnection(data.fromId);
+      }
+
       try {
-        // If there's a collision and we are the polite peer, rollback first
-        if (offerCollision && peer.pc.signalingState !== 'stable') {
-          await peer.pc.setLocalDescription({ type: 'rollback' });
-        }
         await peer.pc.setRemoteDescription(new RTCSessionDescription(data.offer));
         peer.remoteDescriptionSet = true;
 
@@ -401,6 +396,8 @@ export function useVoiceChat(
         });
       } catch (err) {
         console.warn('Error handling voice offer:', err);
+        // If SDP negotiation fails, create a fresh connection
+        peer = createPeerConnection(data.fromId);
       }
     };
 
@@ -436,8 +433,8 @@ export function useVoiceChat(
 
       try {
         await peer.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-      } catch (err) {
-        console.warn('Error adding ICE candidate:', err);
+      } catch {
+        // Silently ignore stale ICE candidates (e.g. from previous connection attempts)
       }
     };
 

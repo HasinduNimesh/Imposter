@@ -342,7 +342,11 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
   const handleLeaveLobby = () => {
     voice.cleanupAll();
     socket?.emit('leave-lobby');
-    clearSession();
+    // Only clear session in waiting phase; during a game the server keeps
+    // the player slot so they can rejoin with the same name & code
+    if (!lobby || lobby.phase === 'waiting') {
+      clearSession();
+    }
     setLobby(null);
     setPlayerData(null);
     setGameResults(null);
@@ -467,6 +471,7 @@ export default function OnlineGame({ onBack }: OnlineGameProps) {
           onBack={handleBackToModes}
           error={error}
           isConnecting={isConnecting}
+          pendingSession={getSession()}
         />
       </>
     );

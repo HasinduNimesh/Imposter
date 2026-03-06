@@ -38,7 +38,7 @@ export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSetti
     useHintForImposter: false,
   });
 
-  const maxImposters = Math.max(1, Math.floor(lobby.players.length / 3));
+  const maxImposters = Math.min(Math.max(1, lobby.players.length - 2), 5);
 
   const handleStart = () => {
     onStartGame({
@@ -217,26 +217,38 @@ export default function OnlineSettings({ lobby, myId, onStartGame }: OnlineSetti
 
       {/* Hint for Imposter */}
       <div className="mb-6">
-        <button
+        <label className="section-title text-sm mb-3 block">💡 Hint for Imposter</label>
+        <div
           onClick={() =>
             setSettings((s) => ({ ...s, useHintForImposter: !s.useHintForImposter }))
           }
-          className={`w-full p-4 rounded-xl border-2 text-left transition-all flex items-center gap-3 ${
+          className={`w-full p-4 rounded-xl border-2 text-left transition-all flex items-center justify-between cursor-pointer ${
             settings.useHintForImposter
               ? 'bg-amber-50 border-amber-300'
-              : 'bg-white border-gray-200'
+              : 'bg-white border-gray-200 hover:border-gray-300'
           }`}
         >
-          <span className="text-2xl">{settings.useHintForImposter ? '💡' : '🔒'}</span>
-          <div>
-            <p className="font-bold text-gray-800 text-sm">Hint for Imposter</p>
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">{settings.useHintForImposter ? '💡' : '🔒'}</span>
             <p className="text-xs text-gray-500">
               {settings.useHintForImposter
                 ? 'Imposters will see a hint about the word'
                 : 'Imposters get no help — hard mode!'}
             </p>
           </div>
-        </button>
+          {/* Toggle switch */}
+          <div
+            className={`relative w-12 h-7 rounded-full transition-colors flex-shrink-0 ${
+              settings.useHintForImposter ? 'bg-amber-400' : 'bg-gray-300'
+            }`}
+          >
+            <div
+              className={`absolute top-0.5 w-6 h-6 bg-white rounded-full shadow-md transition-transform ${
+                settings.useHintForImposter ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
+            />
+          </div>
+        </div>
       </div>
 
       {/* Start */}

@@ -105,6 +105,7 @@ interface ServerLobby extends LobbyState {
   imposterGuess: string | null; // the imposter's word guess
   imposterGuessCorrect: boolean; // whether the guess was correct
   awaitingImposterGuess: boolean; // waiting for imposter to submit guess
+  lastActivity: number; // timestamp of last activity for TTL cleanup
 }
 
 // Stores info about disconnected players so they can rejoin within a timeout
@@ -126,7 +127,35 @@ const MAX_CHAT_HISTORY = 100;
 let chatMsgCounter = 0;
 function nextChatId(): string { return `msg_${++chatMsgCounter}_${Date.now()}`; }
 
-const REJOIN_TIMEOUT_MS = 60_000; // 60 seconds to rejoin
+const REJOIN_TIMEOUT_MS = 86_400_000; // 24 hours to rejoin
+const LOBBY_TTL_MS = 86_400_000; // 24 hours lobby lifetime
+
+// Touch lobby to reset its TTL on any meaningful activity
+function touchLobby(lobby: ServerLobby) {
+  lobby.lastActivity = Date.now();
+}
+
+// Periodic cleanup: remove lobbies inactive for longer than LOBBY_TTL_MS
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, lobby] of lobbies) {
+    if (now - lobby.lastActivity > LOBBY_TTL_MS) {
+      // Clean up all disconnect timers for this lobby
+      for (const player of lobby.players) {
+        const dcKey = `${code}:${player.name.toLowerCase()}`;
+        const dcInfo = disconnectedPlayers.get(dcKey);
+        if (dcInfo) {
+          clearTimeout(dcInfo.timeout);
+          disconnectedPlayers.delete(dcKey);
+        }
+        socketToLobby.delete(player.id);
+      }
+      lobbies.delete(code);
+      chatHistory.delete(code);
+      console.log(`🧹 Lobby ${code} expired after 24h of inactivity`);
+    }
+  }
+}, 60 * 60 * 1000); // check every hour
 
 function generateLobbyCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // removed confusing chars I,O,0,1
@@ -226,11 +255,13 @@ io.on('connection', (socket) => {
       imposterGuess: null,
       imposterGuessCorrect: false,
       awaitingImposterGuess: false,
+      lastActivity: Date.now(),
     };
 
     lobbies.set(code, lobby);
     socketToLobby.set(socket.id, code);
     socket.join(code);
+    touchLobby(lobby);
 
     socket.emit('lobby-created', { code, lobby: getPublicLobby(lobby) });
     console.log(`🏠 Lobby ${code} created by ${playerName}`);
@@ -288,6 +319,7 @@ io.on('connection', (socket) => {
     socketToLobby.set(socket.id, upperCode);
     socket.join(upperCode);
 
+    touchLobby(lobby);
     socket.emit('lobby-joined', { lobby: getPublicLobby(lobby), playerId: socket.id });
     // Send chat history to the joining player
     const history = chatHistory.get(upperCode) || [];
@@ -369,7 +401,7 @@ io.on('connection', (socket) => {
         console.log(`🔄➕ ${playerName} rejoin-fallback joined lobby ${upperCode} (waiting phase)`);
         return;
       } else {
-        socket.emit('error', 'Your 60-second rejoin window has expired. The game is still in progress — ask the host to start a new round.');
+        socket.emit('error', 'Your rejoin window has expired. The game is still in progress — ask the host to start a new round.');
       }
       return;
     }
@@ -500,12 +532,27 @@ io.on('connection', (socket) => {
       lobby: getPublicLobby(lobby),
     });
 
+    touchLobby(lobby);
     console.log(`🔄 ${playerName} rejoined lobby ${upperCode} (phase: ${lobby.phase})`);
   }
 
   // ---- LEAVE LOBBY ----
   socket.on('leave-lobby', () => {
-    cleanupPlayer(socket.id);
+    const code = socketToLobby.get(socket.id);
+    if (!code) return;
+    const lobby = lobbies.get(code);
+    if (!lobby) {
+      socketToLobby.delete(socket.id);
+      return;
+    }
+
+    // If game is in progress, treat as disconnect so they can rejoin
+    if (lobby.phase !== 'waiting') {
+      handlePlayerDisconnect(socket.id);
+    } else {
+      // In waiting phase, remove them completely
+      cleanupPlayer(socket.id);
+    }
   });
 
   // ---- HOST: START SETTINGS ----
@@ -518,6 +565,7 @@ io.on('connection', (socket) => {
     }
 
     lobby.phase = 'settings';
+    touchLobby(lobby);
     io.to(lobby.code).emit('settings-phase', getPublicLobby(lobby));
   });
 
@@ -593,6 +641,7 @@ io.on('connection', (socket) => {
       });
     });
 
+    touchLobby(lobby);
     console.log(`🎮 Game started in lobby ${lobby.code} | Word: ${wordItem.word} | Imposters: ${imposterIds.length}`);
   });
 
@@ -651,6 +700,7 @@ io.on('connection', (socket) => {
 
     lobby.votes[socket.id] = votedForId;
     player.hasVoted = true;
+    touchLobby(lobby);
 
     const activePlayers = lobby.players.filter(p => !p.isDisconnected);
     const votedCount = activePlayers.filter(p => p.hasVoted).length;
@@ -677,6 +727,7 @@ io.on('connection', (socket) => {
     lobby.imposterGuessCorrect = isCorrect;
     lobby.awaitingImposterGuess = false;
 
+    touchLobby(lobby);
     // Now finalize with imposter caught = true (since we only prompt on catch)
     finalizeResults(lobby, true);
   });
@@ -725,6 +776,7 @@ io.on('connection', (socket) => {
       // score is NOT reset — it persists across rounds
     });
 
+    touchLobby(lobby);
     io.to(lobby.code).emit('lobby-updated', getPublicLobby(lobby));
   });
 
